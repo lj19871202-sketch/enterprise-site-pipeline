@@ -7,7 +7,7 @@ scripts/local_pipeline.py
 scripts/run_local.ps1
 ```
 
-脚本在 Codex 当前本机执行，输入 Excel，输出企业官网资料包。不要把这套流程拆成远端会话或手工多机复制。
+脚本在 Codex 当前本机执行，输入 Excel，输出企业官网资料包。不要把这套流程拆成远端会话或手工多机复制。新环境先运行 `bootstrap.ps1` 创建技能独立 `.venv`，并按 `requirements.lock.txt` 安装锁定依赖。
 
 ## 阶段 0 · 读取 Excel
 
@@ -108,12 +108,13 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - `<企业>/产品清单.xlsx`
 - `<run_id>/汇总.xlsx`
 - `<run_id>/en.json`
+- `<run_id>/英文补译清单.json`（存在英文缺口时）
 - `<run_id>/review/视觉核对图/<企业>/*.png`
 - `<run_id>/review/<企业>/图片核对表.xlsx`
 - `<run_id>/review/核对指引.md`
 - `<run_id>/视觉核对.json`
 
-默认自动把企业名、三段简介、产品名和产品详情翻成英文草稿（`en.json` 标 `自动翻译: true`、`定稿: false`），`英文简介` 非空即写入 docx 英文段；产品详情以“中文\nEnglish”写入 `产品清单.xlsx` 的 `产品详情` 列；官网没有独立详情的分类/系列名行写中英双语占位说明，不编造内容。提供 `--en` 时以人工定稿覆盖。
+默认自动把企业名、三段简介、产品名和产品详情翻成英文草稿（`en.json` 标 `自动翻译: true`、`定稿: false`），`英文简介` 非空即写入 docx 英文段；产品详情以“中文\nEnglish”写入 `产品清单.xlsx` 的 `产品详情` 列；官网没有独立详情的分类/系列名行写中英双语占位说明，不编造内容。提供 `--en` 时覆盖。MyMemory 429/限流不再把自检判死，但英文缺口会写入 `英文补译清单.json`，默认门禁阻断发布，等待 Codex 基于中文事实补 `--en`。
 
 验证：
 
@@ -171,7 +172,8 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 所有 error 项通过后，才把 stage 发布到输出目录 `deliverable/`；
 - 官网未发现时 `site_discovery` 为 error；自动发现置信度为中/低时先 warn，Codex 必须打开候选站点复核；
 - `visual_review` 标“不符”必红；未核对默认告警，`--require-visual` 时按 error；
-- 自动翻译失败或源内容过薄时 `en_entry`/`en_ascii` 会红；补数据后用 `--en` 提供定稿；
+- 自动翻译失败或英文缺失时 `en_entry`/`en_ascii`/`product_en`/`product_detail`/`product_map` 默认报红，并生成 `英文补译清单.json`；正常修复是用 `--en` 提供补译草稿或人工定稿后重跑；
+- 只有用户在当次对话中明确接受中文版时，才可加 `--accept-no-english` 将英文相关门禁降为告警；
 - 图片为空先补抓或在 Excel 补充官网，不修改门禁标准；
 - `no_website`、`empty_images`、`partial` 必须进入交付说明。
 
@@ -180,7 +182,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 1. 输入 Excel 行数与 `manifest.json` 的企业数一致；
 2. `gates.json` 没有未解释的 error；
 3. `no_website`、`empty_images`、`partial` 清单可追溯；自动发现的官网置信度为高，或中/低已由 Codex 打开复核；
-4. 英文是“已确认定稿”，或是已标注“自动翻译·待人工核校”的草稿；
+4. 默认交付必须英文完整：`英文补译清单.json` 无未处理项，英文是“已确认定稿”，或是已明确标注“自动翻译·待人工核校”的完整草稿；只有用户明确接受中文版时，才可保留 `accept_no_english` 的告警状态；
 5. 交付目录中的图片引用全部存在，图片、文档、产品清单均已在 `视觉核对.json` 标为“符合”；
 6. docx 中文段与 raw `intro_paragraphs`、产品清单行与 raw `products` 一致；
 7. 没有把密码、token 或 cookie 写入任何输出。

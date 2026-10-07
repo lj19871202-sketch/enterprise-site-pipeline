@@ -27,6 +27,12 @@ python "$SkillRoot\scripts\gates.py" `
 & $PY "...\gates.py" --deliverable "..." --raw "..." --en "..." --summary "..." --require-visual
 ```
 
+仅当用户明确接受中文版时才允许英文缺失：
+
+```powershell
+& $PY "...\gates.py" --deliverable "..." --raw "..." --en "..." --summary "..." --accept-no-english
+```
+
 ## 门禁清单
 
 | id | 级别 | 判据 | 阈值 |
@@ -37,14 +43,14 @@ python "$SkillRoot\scripts\gates.py" `
 | `images` | error | 档案里的图片引用都落到真实文件；交付目录里没有 raw 未记录的孤儿图；跨类重复图；四类图是否全空 | 失效引用 0、孤儿图 0、跨类重复组 0、四类全空 0 家 |
 | `image_required` | warn | 单独检查 `logo` 与 `factory` 两类是否有图；官网确实没有素材时保留告警并写数据边界，不硬性阻断 | 空类 0 条（否则告警） |
 | `image_provenance` | error | 每张图的来源页必须与官网同域；图片直链外域单独列出 | 来源页非官网 0 条（直链外域仅提示） |
-| `en_entry` | error | 英文条目六字段齐全且非空；简介恰 3 段；每段 ≥60 字符；英文名/标题/品牌/简介/产品英名无中日韩字符（`子品类` 是中文分类，豁免） | 问题条目 0 |
-| `en_ascii` | error | 英文段非 ASCII 字符占比 | ≤ 0.02 |
+| `en_entry` | error/warn | 英文条目六字段齐全且非空；简介恰 3 段；每段 ≥60 字符；英文名/标题/品牌/简介/产品英名无中日韩字符（`子品类` 是中文分类，豁免）；只有显式 `--accept-no-english` 才降为 warn | 问题条目 0 |
+| `en_ascii` | error/warn | 英文段非 ASCII 字符占比；只有显式 `--accept-no-english` 才降为 warn | ≤ 0.02 |
 | `en_pinyin` | warn | 英文段疑似拼音/栏目词 token 占比 | ≥ 0.60 告警 |
-| `product_en` | error | 产品名称列必须为“中文/型号 / 英文名”格式，且 ` / ` 右侧含至少 2 个连续拉丁字母 | 空英文行 0 |
+| `product_en` | error/warn | 产品名称列必须为“中文/型号 / 英文名”格式，且 ` / ` 右侧含至少 2 个连续拉丁字母；只有显式 `--accept-no-english` 才降为 warn | 空英文行 0 |
 | `product_detail` | error/warn | `产品详情` 列非空行必须同时含中文和至少 3 个连续英文词；型号字母不算英文译文；无详情行不得留空，官网真实详情覆盖率低于阈值仅告警 | 缺中/英 0 行、空详情 0 行；覆盖率 ≥ 0.30 |
 | `product_image_link` | error/warn | `图片（本地连接）` 列必须指向交付目录内真实存在的相对路径；官网无图必须显式标注，旧占位符视为错误 | 无效/空/占位链接 0 行；官网无图行告警 |
 | `product_rows` | error | `产品清单.xlsx` 数据行（按 ` / ` 取中文名）与 raw `products` 顺序逐行一致 | 不一致家数 0 |
-| `product_map` | error | 档案产品在 `产品英名` 中的覆盖率 | ≥ 0.80 |
+| `product_map` | error/warn | 档案产品在 `产品英名` 中的覆盖率；只有显式 `--accept-no-english` 才降为 warn | ≥ 0.80 |
 | `docx_sync` | error | docx 英文段与 `en.json` 英文简介逐字一致 | 不一致家数 0 |
 | `docx_source` | error | docx 中文段与 raw `intro_paragraphs` 逐段一致 | 不一致家数 0 |
 | `noise` | error | 中文或英文正文段不含导航/备案/联系方式/黄页词等噪声模式 | 命中 0 |
@@ -55,7 +61,7 @@ python "$SkillRoot\scripts\gates.py" `
 
 **`site_discovery`** —— 官网是整条流水线的事实源。未发现官网直接 error；自动发现置信度为中/低时先 warn，Codex 必须打开候选站点核对，确认后再运行或补 Excel 官网列；不允许把低置信度结果静默当事实。
 
-**`en_entry` / `en_ascii`** —— 默认英文来自自动中译英草稿，`en.json` 带 `自动翻译: true`、`定稿: false`、`翻译失败` 标记；门禁仍按可交付英文标准检查三段简介、无中日韩字符和非 ASCII 占比。门禁红说明自动草稿不达标，应补数据或用 `--en` 提供定稿，不要下调阈值。
+**`en_entry` / `en_ascii` / `product_en` / `product_detail` / `product_map`** —— 默认英文来自自动中译英草稿，`en.json` 带 `自动翻译: true`、`定稿: false`、`翻译失败` 标记。英文缺口会先写入 `<run_id>/英文补译清单.json`，门禁默认按 error 阻断发布，正常修复路径是补 `--en`。MyMemory 429/限流在 `--selftest` 中是可恢复 `WARN`，不等于允许带英文缺口交付。只有用户在当次对话中明确接受中文版时，`--accept-no-english` 才把英文缺失降为 warn；检查仍执行，缺口仍保留在结果中。
 
 **`product_en`** —— 只看产品名存在不够；必须能在 ` / ` 右侧读到真正的英文名，型号字母本身不能算英文已补齐。
 

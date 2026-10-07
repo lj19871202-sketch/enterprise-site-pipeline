@@ -1,0 +1,6 @@
+# 本技能已在本机 Codex Windows 运行时验证的精确版本。
+# bootstrap.ps1 默认安装此文件，避免新环境拿到未来不兼容的大版本。
+openpyxl==3.1.5
+python-docx==1.2.0
+Pillow==12.3.0
+playwright==1.63.0

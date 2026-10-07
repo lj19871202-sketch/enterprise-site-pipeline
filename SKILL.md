@@ -66,10 +66,16 @@ metadata:
 $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
 ```
 
-环境自检（依赖 / 网络 / 翻译 / 官网可达性，建议新环境第一步就跑）：
+新环境第一步先引导：创建技能独立 `.venv`，按 `requirements.lock.txt` 安装已验证版本，并运行环境自检。`run_local.ps1` 缺核心依赖时也会自动调用它：
 
 ```powershell
-python "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业名录.xlsx"
+& "$SkillRoot\bootstrap.ps1"
+```
+
+之后可单独复跑环境自检（依赖 / 网络 / 翻译 / 官网可达性）：
+
+```powershell
+& "$SkillRoot\.venv\Scripts\python.exe" "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业名录.xlsx"
 ```
 
 渲染内核兜底顺序（不强制下载 Chromium）：
@@ -124,9 +130,11 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 | `--publish-stage <build/run_id>` | 视觉核对与门禁通过后，把已完成构建目录发布到 `--out` |
 | `--require-visual` / `-RequireVisual` | 视觉核对未完成按 error 处理，不允许直接发布 |
 | `--proxy` | 本机 HTTP(S) 代理 |
-| `--en <json>` | 用人工确认的英文覆盖自动翻译 |
+| `--en <json>` | 用人工确认英文或 Codex 补译草稿覆盖自动翻译；模型草稿必须保留 `定稿: false`、`自动翻译: true` |
 | `-HtmlDir <目录>` / `--html-dir <目录>` | 用 Codex 内置浏览器保存的离线 HTML 兜底抓取（目录内需 `manifest.json`） |
-| `--no-translate` | 关闭自动翻译，只输出中文并把英文层留空 |
+| `--no-translate` | 关闭自动翻译，只输出中文并把英文层留空；未显式接受中文版时仍会阻断发布 |
+| `--accept-no-english` / `-AcceptNoEnglish` | 仅由用户明确接受中文版时使用；英文相关门禁降为告警，不能由 Codex 自行默认开启 |
+| `-NoBootstrap` | 禁止 `run_local.ps1` 自动创建 `.venv`，用于已确认自行管理依赖的环境 |
 | `--translate-email <邮箱>` | 可选，MyMemory 联系邮箱，用于提高匿名翻译额度 |
 | `--no-visual-review` | 跳过拼版/核对表和视觉核对.json 生成 |
 | `--strict` | 门禁未通过时返回非零退出码（`run_local.ps1` 默认启用；用 `-AllowRed` 关闭） |
@@ -139,19 +147,19 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 | 1 | 官网发现 | 用户官网优先；否则多引擎自动发现并抓取候选首页，按公司名命中度分级；低置信度交由 Codex 复核 | 命中且置信度可接受；完全找不到才标 `no_website` |
 | 2 | 页面抓取 | 首页 + 关于/工厂/资质页；产品分类/列表页优先并下钻一层补齐叶子分类与详情，保留标题、正文、链接、图片 | `raw/*.json` 有页面记录 |
 | 3 | 内容与图片 | 抽取中文简介、产品名、产品详情、主营和地址；只有详情或产品图佐证的条目才作为产品；识别站头 logo 与 CSS 背景横幅，图片按四类落盘 | 图片引用真实存在、产品详情中英双语、产品图本地链接有效 |
-| 4 | 渲染 | 生成中英双语企业 docx、产品清单 xlsx、汇总 xlsx | 文件可打开且结构完整 |
+| 4 | 渲染 | 生成中英双语企业 docx、产品清单 xlsx、汇总 xlsx；英文缺口写 `英文补译清单.json` | 文件可打开且结构完整；有英文缺口时补齐或取得用户明确接受 |
 | 5 | 视觉核对 | 生成拼版、核对表和核对指引；Codex 自己看图，经 `visual_review.py --apply` 回写 `视觉核对.json` | 无“不符”，核对完成 |
 | 6 | 门禁 | 自动调用 `gates.py` | `gates.json` 无 error |
 
 ## 开工顺序
 
 1. **确认 Excel。** 先核对表头、企业数、是否已有官网列；不要猜测企业简称。没有官网列时按企业名称自动发现，不再要求用户先提供域名。
-2. **小样本试跑。** 用 `-Limit 1` 或 `-Limit 3 -NoPublish`，检查官网命中置信度、图片归档、docx/xlsx 和门禁日志；低置信度官网由 Codex 打开确认。
+2. **小样本试跑。** 用 `-Limit 1` 或 `-Limit 3 -NoPublish`，检查官网命中置信度、图片归档、docx/xlsx、`英文补译清单.json` 和门禁日志；低置信度官网由 Codex 打开确认。
 3. **完整运行。** 小样本通过后去掉 `-Limit` 运行全部企业（推荐 `-NoPublish`，先构建待核对）。
 4. **视觉核对（Codex 自己做）。** 打开 `review/核对指引.md`，用图像查看工具逐张看 `review/视觉核对图/<企业>/0.总览.png` 和每个分类拼版；把结论写成 `verdicts.json`，执行 `visual_review.py --apply` 回写，再跑 `gates.py --require-visual`。核对完成后用 `local_pipeline.py --publish-stage <build/run_id> --out <输出目录>` 发布。
 5. **复核门禁。** 先看 `gates.json` 的 error 项，再看 `empty_images`、`no_website`、`partial` 清单。
-6. **核对英文。** 默认会写入自动翻译英文草稿并标注待人工核校；需要定稿时用 `--en <已确认英文.json>` 覆盖后重跑。
-7. **发布。** 仅在门禁通过或用户明确接受“英文待定稿”时交付。门禁红色修数据或补抓，不下调阈值迁就数据。
+6. **核对英文。** 默认会写入自动翻译英文草稿并标注待人工核校。MyMemory 429/限流是 `WARN` 可恢复告警，不把新环境判为不可用；英文缺口会写入 `<run_id>/英文补译清单.json`，Codex 必须基于 raw 中文事实补出 `--en` 兼容草稿后重跑。用户在当次对话中明确接受中文版时，才可加 `--accept-no-english` / `-AcceptNoEnglish`。
+7. **发布。** 默认英文缺失会阻断发布；只有补 `--en` 或用户明确接受中文版后才交付。门禁红色先修数据或补抓，不下调阈值迁就数据。
 
 ## 硬性约束
 
@@ -159,7 +167,8 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 - **不要记录密码、token、cookie。** 不要求用户把凭据写入 skill、Excel、日志或命令行历史。
 - **不臆造企业事实。** 产业、业务、产品、资质只能来自官网快照或用户资料。
 - **无官网列要自动发现，低置信度必须复核。** 输入表缺官网列时，先由脚本自动搜索、抓取和打分；高/中置信度自动采用，低置信度必须由 Codex 打开站点确认后再交付，不得直接跳过该企业。
-- **依赖必须齐全。** 首次在新环境使用先跑 `--selftest`；`openpyxl`、`python-docx`、`Pillow` 缺一即视为环境未就绪（Pillow 缺失会让视觉核对材料静默消失）。`run_local.ps1` 默认检测 Playwright 包，内置 Chromium 不可用时复用本机 Edge 作为渲染内核（两者都缺失才下载 Chromium）；网络受限无法安装时，用 `-NoPlaywrightInstall` 显式降级并说明。
+- **依赖必须齐全且锁定。** 新环境先运行 `bootstrap.ps1`；它创建技能独立 `.venv`，按 `requirements.lock.txt` 安装 `openpyxl`、`python-docx`、`Pillow`、`playwright` 的已验证版本。`requirements.txt` 只提供带主版本上限的可更新范围。`run_local.ps1` 缺核心依赖时会自动引导。Pillow 缺失会让视觉核对材料静默消失，不能被当作“没有疑点”。
+- **Playwright 复用优先。** `run_local.ps1` 先复用当前 Python/技能 `.venv` 中已有的 Playwright；渲染内核按内置 Chromium → 本机 Edge 自动选择，两者都不可用才考虑安装 Chromium。可用 Codex 内置浏览器保存 HTML 并经 `-HtmlDir` 兜底。
 - **机翻不等于定稿。** 自动英文来自机翻，必须在 `en.json`/汇总/交付说明中保留 `自动翻译: true`、`待人工核校` 标记，不得当作人工定稿交付。
 - **不把空结果当成功。** 四类图全空、官网未确认、简介不足三段都要显式记录并单独列出。
 - **不跳视觉核对，也不把核对推给用户。** 图片内容是否属于该企业、该分类，只能看图判断；Codex 必须自己查看拼版并回写结论，不得在未核对时声称图片已核验，也不得把 `待核对` 留给用户后发布终稿。

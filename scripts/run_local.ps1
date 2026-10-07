@@ -5,6 +5,7 @@
     [string]$Out = "",
     [string]$En = "",
     [string]$HtmlDir = "",          # Codex 内置浏览器保存的离线 HTML 目录（含 manifest.json）
+    [switch]$AcceptNoEnglish,       # 用户明确接受中文版；英文相关门禁降为告警
     [int]$Limit = 0,
     [string]$TranslateEmail = "",
     [switch]$NoTranslate,
@@ -15,14 +16,18 @@
     [switch]$RequireVisual,         # 视觉核对未完成按 error 处理
     [switch]$NoPublish,             # 先只构建，Codex 核对后再 --publish-stage
     [int]$PlaywrightInstallTimeoutSec = 600,  # 单次 Playwright/Chromium 安装超时（秒）
-    # 默认严格模式：门禁出现 error 时返回非零退出码。
+    [switch]$NoBootstrap,          # 缺核心依赖时不自动创建 .venv
+    # 默认严格模式：门禁出现 error 时返回非零退出码；缺失英文须用 -En 补稿或显式 -AcceptNoEnglish。
     # 仅在明确接受"红灯产物"的调试场景加 -AllowRed 关闭。
     [switch]$AllowRed
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$skillRoot = Split-Path -Parent $scriptDir
 $pipeline = Join-Path $scriptDir "local_pipeline.py"
+$bootstrap = Join-Path $skillRoot "bootstrap.ps1"
+$venvPython = Join-Path $skillRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $pipeline)) {
     throw "找不到 local_pipeline.py：$pipeline"
 }
@@ -69,8 +74,9 @@ function Invoke-ProcessWithTimeout {
     return $proc.ExitCode
 }
 
-# ---- 找 Python：优先“核心依赖 + 本地已有 Playwright”，否则找核心依赖后在原地安装 ----
+# ---- 找 Python：优先技能独立 .venv，其次核心依赖 + 本地已有 Playwright ----
 $candidates = @()
+if (Test-Path -LiteralPath $venvPython) { $candidates += $venvPython }
 if ($env:CODEX_PYTHON) { $candidates += $env:CODEX_PYTHON }
 foreach ($name in @("python.exe", "python3.exe")) {
     $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -103,8 +109,25 @@ if (-not $python) {
     }
 }
 if (-not $python) {
-    throw ("未找到同时含 openpyxl / python-docx / Pillow 的 Python。" +
-           "请设置 CODEX_PYTHON，或先执行： <python.exe> -m pip install -r requirements.txt")
+    if (-not $NoBootstrap) {
+        if (-not (Test-Path -LiteralPath $bootstrap)) {
+            throw "缺少核心依赖，且找不到 bootstrap.ps1：$bootstrap"
+        }
+        Write-Host "[bootstrap] 未找到完整依赖，正在创建技能独立环境..."
+        & $bootstrap -SkipSelftest
+        if ($LASTEXITCODE -ne 0) { throw "bootstrap.ps1 失败，退出码 $LASTEXITCODE" }
+        if (Test-Path -LiteralPath $venvPython) {
+            $probeExit = Invoke-NativeProbe -FilePath $venvPython -Arguments @("-c", "import openpyxl, docx, PIL, playwright")
+            if ($probeExit -eq 0) {
+                $python = $venvPython
+                $pythonHasPlaywright = $true
+            }
+        }
+    }
+    if (-not $python) {
+        throw ("未找到同时含 openpyxl / python-docx / Pillow 的 Python。" +
+               "请运行 bootstrap.ps1，或设置 CODEX_PYTHON 后安装 requirements.lock.txt。")
+    }
 }
 
 # ---- Playwright：检测本地 -> 缺失则安装 Playwright；渲染内核优先本机 Edge ----
@@ -186,6 +209,7 @@ if ($HtmlDir) {
 if ($Limit -gt 0) { $runArgs += @("--limit", [string]$Limit) }
 if ($TranslateEmail) { $runArgs += @("--translate-email", $TranslateEmail) }
 if ($NoTranslate) { $runArgs += "--no-translate" }
+if ($AcceptNoEnglish) { $runArgs += "--accept-no-english" }
 if ($NoVisualReview) { $runArgs += "--no-visual-review" }
 if ($RequireVisual) { $runArgs += "--require-visual" }
 if ($NoPublish) { $runArgs += "--no-publish" }

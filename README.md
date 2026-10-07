@@ -22,6 +22,13 @@
 
 高/中置信度自动采用；低置信度会在门禁里列为需复核，由 Codex 打开站点确认后再交付。
 
+新环境先引导：创建技能独立 `.venv`，按 `requirements.lock.txt` 安装锁定依赖并自检。`run_local.ps1` 缺核心依赖时也会自动调用：
+
+```powershell
+$SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
+& "$SkillRoot\bootstrap.ps1"
+```
+
 Windows PowerShell 一键运行：
 
 ```powershell
@@ -56,11 +63,10 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 环境自检（依赖 / 网络 / 翻译 / 官网可达性）：
 
 ```powershell
-python "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业名录.xlsx"
+& "$SkillRoot\.venv\Scripts\python.exe" "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业名录.xlsx"
 ```
 
-如果本机 `python` 不在 PATH，用 `$env:CODEX_PYTHON` 指定解释器，或安装依赖：
-`<python.exe> -m pip install -r "$SkillRoot\requirements.txt"`。
+如果本机 `python` 不在 PATH，先运行 `bootstrap.ps1`，或用 `$env:CODEX_PYTHON` 指定解释器。手工安装依赖时优先使用锁定版本：`<python.exe> -m pip install -r "$SkillRoot\requirements.lock.txt"`；`requirements.txt` 只提供带主版本上限的可更新范围。MyMemory 429/限流在自检中是 `WARN` 可恢复告警，不代表环境不可用。
 
 ## 输出
 
@@ -70,6 +76,7 @@ python "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业
 │   ├── raw/                 # 每家企业抓取事实
 │   ├── deliverable/         # 企业文件夹、docx、产品清单
 │   ├── en.json              # 英文层：自动翻译草稿，可被 --en 覆盖
+│   ├── 英文补译清单.json     # 英文缺口清单：Codex 生成 --en 补稿的依据
 │   ├── 视觉核对.json         # 图片/文档/产品的视觉核对结论
 │   ├── review/              # 拼版图 + 缩略图核对表 + 核对指引.md
 │   ├── 汇总.xlsx
@@ -94,9 +101,11 @@ python "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业
 | `--publish-stage <build/run_id>` | 核对与门禁通过后，把已完成构建目录发布到 `--out` |
 | `-RequireVisual` / `--require-visual` | 视觉核对未完成按 error 处理 |
 | `--proxy` | 本机 HTTP(S) 代理 |
-| `-En <json>` / `--en <json>` | 用人工确认稿或 Codex 补翻草稿覆盖自动翻译（模型草稿必须保留 `定稿: false`） |
+| `-En <json>` / `--en <json>` | 用人工确认稿或 Codex 补翻草稿覆盖自动翻译（模型草稿必须保留 `定稿: false`、`自动翻译: true`） |
 | `-HtmlDir <目录>` / `--html-dir <目录>` | 用 Codex 内置浏览器保存的离线 HTML 兜底抓取（目录内需 `manifest.json`） |
-| `-NoTranslate` / `--no-translate` | 关闭自动翻译，只输出中文 |
+| `-NoTranslate` / `--no-translate` | 关闭自动翻译，只输出中文；未显式接受中文版时仍阻断发布 |
+| `-AcceptNoEnglish` / `--accept-no-english` | 仅由用户明确接受中文版时使用；英文相关门禁降为告警 |
+| `-NoBootstrap` | 禁止 `run_local.ps1` 自动创建 `.venv` |
 | `--translate-email <邮箱>` | 可选，提高 MyMemory 匿名翻译额度 |
 | `-NoVisualReview` / `--no-visual-review` | 跳过拼版、核对表和 `视觉核对.json` 生成 |
 | `--strict` | 门禁不通过时返回非零退出码（`run_local.ps1` 默认启用；CLI 直跑需显式加） |
@@ -112,6 +121,7 @@ python "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业
 - 每家企业必须有四类图片目录、简介 docx、产品清单 xlsx；
 - docx 中文段必须等于 raw `intro_paragraphs`，产品清单数据行必须等于 raw `products`，产品详情列必须中英双语且无空值；`图片（本地连接）` 列必须指向交付目录内真实存在的 `2.企业产品图/...` 文件，官网无图时显式标注，不得保留旧占位符；
 - 英文默认自动中译英并写入正文，`en.json` 标 `自动翻译: true` 待人工核校；提供 `--en` 后覆盖，人工确认稿标 `定稿: true`，MyMemory 失败时由 Codex 补翻的草稿仍标 `定稿: false`；
+- 英文缺口会写入 `英文补译清单.json`；默认 `en_entry`、`en_ascii`、`product_en`、`product_detail`、`product_map` 的缺失均为 error，必须补 `--en` 后重跑。只有用户明确接受中文版时，`--accept-no-english` 才把这些英文检查降为告警；
 - 官网必须找到；自动发现置信度为低/中时列出，低置信度由 Codex 打开站点复核；
 - 汇总表、档案、目录和英文集合必须一致；
 - 图片内容需视觉核对，结论写入 `视觉核对.json`：标“不符”即报红，未核对默认告警；加 `--require-visual` 后未核对直接报红。
@@ -145,7 +155,7 @@ python "$SkillRoot\scripts\gates.py" --deliverable "<...>\deliverable" --raw "<.
 
 - 抓取默认 `auto`：静态页面直接抓，疑似 JS 渲染页自动用 Playwright 重抓。`run_local.ps1` 会优先复用本机已有 Playwright；渲染内核先试内置 Chromium，不可用时自动改用本机 Microsoft Edge（Windows 自带，不需要下载 Chromium），两者都没有才下载。网络受限无法安装时加 `-NoPlaywrightInstall` 显式降级为静态抓取；Chromium/Edge 都不可用时，可用 Codex 内置浏览器保存渲染后的 HTML，加 `-HtmlDir` 走离线快照兜底。
 - 自动官网发现依赖搜索引擎可达性；置信度低时 Codex 必须打开候选站点复核，完全找不到才标 `no_website`。
-- 英文默认走 MyMemory 免费接口自动中译英。该接口有每日匿名额度，批量较大时部分条目可能翻译失败：失败条目在 `en.json` 标 `翻译失败: true`，门禁 `en_entry` 报红，需稍后重跑（结果有本地缓存 `_translate_cache.json`）、加 `--translate-email` 提高额度，或用 `--en` 提供定稿；持续 429 时可由 Codex 基于中文事实补翻为 `--en` 草稿，但必须保留 `定稿: false`。
+- 英文默认走 MyMemory 免费接口自动中译英。该接口有每日匿名额度，批量较大时部分条目可能翻译失败：失败条目在 `en.json` 标 `翻译失败: true`，并写入 `英文补译清单.json`；自检中的 429 是可恢复 `WARN`，不是环境致命错误。默认门禁阻断发布，Codex 必须基于中文事实生成 `--en` 补译草稿并保留 `定稿: false`、`自动翻译: true`、`备注: 待人工核校`。只有用户明确接受中文版时才可使用 `--accept-no-english`。
 - 输入格式当前以 `.xlsx` / `.xlsm` 为主；老式 `.xls` 请先另存为 `.xlsx`。
 
 详细说明见 `SKILL.md` 和 `references/`。

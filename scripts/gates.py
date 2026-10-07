@@ -289,6 +289,11 @@ def gate_image_provenance(ctx):
     return Gate("image_provenance", "error", not bad, detail, bad + offsite)
 
 
+def english_gate_level(ctx):
+    """英文缺失默认阻断；仅在用户明确接受中文版时降为告警。"""
+    return "warn" if ctx.get("accept_no_english") else "error"
+
+
 def gate_en_entry(ctx):
     bad = []
     for name, v in (ctx["en"] or {}).items():
@@ -321,7 +326,11 @@ def gate_en_entry(ctx):
             probs.append("含中文/全角")
         if probs:
             bad.append(f"{name}:{'/'.join(sorted(set(probs)))}")
-    return Gate("en_entry", "error", not bad, f"{len(bad)} 家英文条目不完整", bad)
+    level = english_gate_level(ctx)
+    detail = f"{len(bad)} 家英文条目不完整"
+    if level == "warn":
+        detail += "；用户已接受中文版，英文缺失仅告警"
+    return Gate("en_entry", level, not bad, detail, bad)
 
 
 def gate_en_ascii(ctx):
@@ -334,7 +343,7 @@ def gate_en_ascii(ctx):
             worst = max(worst, ratio)
             if ratio > ctx["ascii_max"]:
                 bad.append(f"{name}#{i + 1} 非ASCII {ratio:.1%}")
-    return Gate("en_ascii", "error", not bad,
+    return Gate("en_ascii", english_gate_level(ctx), not bad,
                 f"{len(bad)} 段非ASCII超阈值；最高 {worst:.1%}", bad)
 
 
@@ -369,7 +378,8 @@ def gate_product_en(ctx):
             _zh, sep, eng = text.partition(" / ")
             if not sep or not re.search(r"[A-Za-z]{2,}", eng):
                 bad.append(f"{name} 行{r}: {text[:30]}")
-    return Gate("product_en", "error", not bad, f"{len(bad)} 行产品缺英文", bad)
+    return Gate("product_en", english_gate_level(ctx), not bad,
+                f"{len(bad)} 行产品缺英文", bad)
 
 
 def gate_product_detail(ctx):
@@ -399,7 +409,8 @@ def gate_product_detail(ctx):
                 hit += 1
     coverage = hit / total if total else 1.0
     if bad:
-        return Gate("product_detail", "error", False, f"{len(bad)} 行产品详情不完整", bad)
+        return Gate("product_detail", english_gate_level(ctx), False,
+                    f"{len(bad)} 行产品详情不完整", bad)
     ok = (not empty) and coverage >= ctx.get("detail_min", 0.30)
     detail = (f"中英双语 {total - empty}/{total} 行；官网独立详情覆盖 {coverage:.0%}"
               f"（其余为分类/系列名双语占位说明）")
@@ -487,7 +498,7 @@ def gate_product_map(ctx):
         hit = sum(1 for p in prods if p in pm)
         if hit / len(prods) < ctx["map_min"]:
             bad.append(f"{name} {hit}/{len(prods)}")
-    return Gate("product_map", "error", not bad,
+    return Gate("product_map", english_gate_level(ctx), not bad,
                 f"{len(bad)} 家产品英名覆盖率低于 {ctx['map_min']:.0%}", bad)
 
 
@@ -652,6 +663,8 @@ def main():
     ap.add_argument("--summary", default="", help="汇总 xlsx")
     ap.add_argument("--visual", default="", help="视觉核对.json，默认取 deliverable 同级")
     ap.add_argument("--require-visual", action="store_true", help="视觉核对未完成按 error 处理")
+    ap.add_argument("--accept-no-english", action="store_true",
+                    help="用户明确接受中文版；英文缺失降为告警")
     ap.add_argument("--expected", type=int, default=0, help="期望企业数，0=不校验")
     ap.add_argument("--only", default="", help="只跑指定门禁，逗号分隔")
     ap.add_argument("--json", dest="json_out", default="", help="把结果写 json")
@@ -688,6 +701,7 @@ def main():
         "summary": pick("summary", a.summary),
         "visual": visual_path,
         "require_visual": bool(a.require_visual or cfg.get("require_visual")),
+        "accept_no_english": bool(a.accept_no_english or cfg.get("accept_no_english")),
         "expected": a.expected or int(cfg.get("expected_companies") or 0),
         "ascii_max": (a.ascii_max if a.ascii_max is not None
                       else float(cfg.get("ascii_max", 0.02))),

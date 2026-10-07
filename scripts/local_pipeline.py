@@ -641,7 +641,45 @@ def empty_english_entry(archive):
     return {
         "英文名": "", "英文标题": archive.get("名称", ""), "品牌": "", "英文简介": [],
         "产品英名": {}, "产品详情英": {}, "子品类": archive.get("产业", ""),
-        "定稿": False, "自动翻译": False, "备注": "未启用自动翻译",
+        "定稿": False, "自动翻译": False, "翻译失败": True,
+        "备注": "未启用自动翻译；需补 --en 或明确接受中文版",
+    }
+
+
+def english_backlog(archives, en_data):
+    """列出自动翻译失败或英文层缺口，供 Codex 生成 --en 补译稿。"""
+    items = {}
+    for archive in archives:
+        name = archive.get("名称", "")
+        entry = en_data.get(name) or {}
+        products = archive.get("products") or []
+        details = archive.get("product_details") or {}
+        product_en = entry.get("产品英名") if isinstance(entry.get("产品英名"), dict) else {}
+        detail_en = entry.get("产品详情英") if isinstance(entry.get("产品详情英"), dict) else {}
+        missing_products = [p for p in products if not clean_inline(product_en.get(p, ""))]
+        missing_details = [p for p in details if not clean_inline(detail_en.get(p, ""))]
+        paras = entry.get("英文简介") if isinstance(entry.get("英文简介"), list) else []
+        problems = []
+        if entry.get("翻译失败") is True:
+            problems.append("自动翻译未完成")
+        if not clean_inline(entry.get("英文名", "")):
+            problems.append("英文名为空")
+        if len([p for p in paras if clean_inline(p)]) != 3:
+            problems.append("英文简介不足三段")
+        if missing_products:
+            problems.append("产品英名缺 %d 个" % len(missing_products))
+        if missing_details:
+            problems.append("产品详情英缺 %d 个" % len(missing_details))
+        if problems:
+            items[name] = {
+                "问题": problems,
+                "建议": "基于 raw 中文事实生成 --en 兼容 JSON；保留 定稿:false、自动翻译:true、备注:待人工核校",
+                "缺产品英名": missing_products,
+                "缺产品详情英": missing_details,
+            }
+    return {
+        "说明": "自动英文不完整。默认门禁禁止发布；Codex 必须用 --en 补稿，或由用户明确 --accept-no-english 接受中文版。",
+        "企业": items,
     }
 
 
@@ -1540,6 +1578,7 @@ def load_en(path, archives, args=None, cache_path=None):
         for entry in data.values():
             if isinstance(entry, dict):
                 entry.setdefault("定稿", True)
+                entry.setdefault("翻译失败", False)
         return data
     if args is None or getattr(args, "no_translate", False):
         return {a["名称"]: empty_english_entry(a) for a in archives}
@@ -1598,7 +1637,8 @@ def build_visual_review(stage, deliverable, raw_dir):
     return json_path, log_text
 
 
-def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=None, require_visual=False):
+def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=None,
+              require_visual=False, allow_no_english=False):
     gate = Path(__file__).with_name("gates.py")
     if not gate.is_file():
         return None, "找不到 gates.py"
@@ -1611,6 +1651,8 @@ def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=No
         cmd += ["--visual", str(visual)]
     if require_visual:
         cmd += ["--require-visual"]
+    if allow_no_english:
+        cmd += ["--accept-no-english"]
     proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
     (stage / "gates.log").write_text(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), encoding="utf-8")
     return proc.returncode == 0, proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
@@ -1676,6 +1718,7 @@ def run_selftest(args):
     print(line)
 
     ok = True
+    recoverable = []
 
     def probe(label, mod, required=True):
         nonlocal ok
@@ -1713,8 +1756,11 @@ def run_selftest(args):
                        ("MyMemory 翻译接口", TRANSLATE_URL + "?q=test&langpair=zh-CN|en")):
         r = fetch(url, args)
         if r.get("error"):
-            print(f"  [FAIL] {label}：{r['error']}")
             if label.startswith("MyMemory"):
+                print(f"  [WARN] {label}：{r['error']}（可恢复：Codex 用 --en 补英文草稿）")
+                recoverable.append(f"{label}：{r['error']}")
+            else:
+                print(f"  [FAIL] {label}：{r['error']}")
                 ok = False
         else:
             print(f"  [OK]   {label}（HTTP {r.get('status') or '?'}）")
@@ -1724,9 +1770,12 @@ def run_selftest(args):
     if got:
         print(f"  [OK]   中译英可用：企业 → {got}")
     else:
-        print("  [FAIL] 中译英不可用（MyMemory 限流或网络不通）；"
-              "英文层会留空，可用 --no-translate 或 --en 提供定稿")
-        ok = False
+        print("  [WARN] 中译英不可用（MyMemory 限流或网络不通）；"
+              "不是环境致命错误，但默认门禁会阻止英文缺失时发布。")
+        print("         必须由 Codex 基于中文事实生成 --en 兼容英文草稿，"
+              "保留 定稿:false、自动翻译:true、备注:待人工核校；"
+              "或由用户明确接受中文版。")
+        recoverable.append("中译英不可用，需 Codex 补 --en 草稿")
 
     print("\n[4/4] 输入 Excel 与官网可达性")
     excel = Path(args.excel).expanduser() if args.excel else None
@@ -1767,6 +1816,9 @@ def run_selftest(args):
 
     print("\n" + line)
     print("自检通过，可以运行流水线。" if ok else "自检未通过，请先修复上面标 FAIL 的项。")
+    if recoverable:
+        print("可恢复告警：" + "；".join(recoverable[:3]))
+        print("处理方式：默认门禁不允许英文缺失直接发布；Codex 补 --en 草稿，或用户显式 --accept-no-english。")
     print(line)
     return 0 if ok else 1
 
@@ -1803,7 +1855,9 @@ def main():
                     help="门禁通过也不发布，只保留 build/<run_id>（用于先做视觉核对）")
     ap.add_argument("--strict", action="store_true", help="门禁不通过时返回非零退出码")
     ap.add_argument("--no-translate", dest="no_translate", action="store_true",
-                    help="关闭自动中英双语，仅输出中文并把英文层留空")
+                    help="关闭自动中英双语，仅输出中文并把英文层留空（仍需 --accept-no-english 才能发布）")
+    ap.add_argument("--accept-no-english", dest="accept_no_english", action="store_true",
+                    help="用户明确接受中文版；英文相关门禁降为告警，不建议用于默认双语交付")
     ap.add_argument("--translate-email", default="", help="可选：MyMemory 联系邮箱，用于提高匿名额度")
     ap.add_argument("--translate-delay", type=float, default=0.2, help="每次翻译调用后的间隔秒数")
     ap.add_argument("--no-visual-review", dest="no_visual_review", action="store_true",
@@ -1849,6 +1903,12 @@ def main():
         archives.append(a)
         log(f"  {a.get('status')} · 官网 {a.get('官网') or '未确认'} · 图片 {sum(len(a.get(k) or []) for k in IMAGE_DIRS)}")
     en_data = load_en(args.en, archives, args, out / "_translate_cache.json")
+    backlog = english_backlog(archives, en_data)
+    backlog_path = ""
+    if backlog["企业"]:
+        backlog_path = str(stage / "英文补译清单.json")
+        write_json(Path(backlog_path), backlog)
+        log(f"英文补译清单：{backlog_path}（默认门禁会阻止直接发布）")
     deliverable, raw_dir, en_path, summary = render_stage(stage, archives, en_data)
     visual_path, visual_log = None, ""
     if not args.no_visual_review:
@@ -1864,6 +1924,8 @@ def main():
         "excel": excel.name, "status_counts": dict(collections.Counter(a.get("status", "") for a in archives)),
         "english_final": bool(args.en),
         "english_mode": "final" if args.en else ("off" if args.no_translate else "auto"),
+        "accept_no_english": bool(args.accept_no_english),
+        "english_backlog": backlog_path,
         "visual_review": str(visual_path) if visual_path else "",
         "visual_review_dir": str(stage / "review") if visual_path else "",
         "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -1871,6 +1933,7 @@ def main():
     passed, gate_log = run_gates(
         stage, deliverable, raw_dir, en_path, summary, len(archives), visual_path,
         require_visual=args.require_visual,
+        allow_no_english=args.accept_no_english,
     )
     log("\n" + (gate_log or "未运行门禁"))
     if passed:
@@ -1881,7 +1944,8 @@ def main():
         log(f"门禁通过，已发布：{published}")
         return 0
     log(f"产物已生成但门禁未全绿：{stage}")
-    log("英文为自动翻译草稿且有门禁项为红：核对 gates.json，必要时加 --en <已确认英文.json> 覆盖或补数据后重跑。")
+    log("英文缺失或自动翻译失败时，必须补 --en <英文草稿/定稿.json>；"
+        "只有用户明确接受中文版时才可加 --accept-no-english。")
     return 1 if args.strict else 0
 
 

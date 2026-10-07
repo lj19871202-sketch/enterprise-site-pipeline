@@ -1,7 +1,7 @@
 interface:
   display_name: "企业官网资料包流水线"
   short_description: "读取本地 Excel，本机自动发现官网并产出中英双语 docx/xlsx 资料包"
-  default_prompt: "使用 $enterprise-site-pipeline：读取用户提供的本地 Excel。即使没有官网列，也要按企业名称在本机自动多引擎发现官网并抓取候选首页评分；高/中置信度自动采用，低置信度必须由 Codex 打开站点复核。run_local.ps1 默认检测并安装 Playwright；渲染内核先试内置 Chromium，不可用时自动改用本机 Edge，两者都无才下载 Chromium；抓取默认 auto（静态过薄时自动渲染），内核都不可用时由 Codex 内置浏览器保存 HTML 并以 -HtmlDir 兜底。先小样本 -NoPublish 运行，再让 Codex 自己用图像查看工具逐张核对 review/视觉核对图 下的总览和分类拼版，经 visual_review.py --apply 回写 视觉核对.json，跑 gates.py --require-visual 通过后用 local_pipeline.py --publish-stage 发布。全程在本机执行，不使用 SSH 或远端 worker；英文默认自动翻译生成，必须标注“自动翻译，待人工核校”，需要定稿时用 --en 覆盖。"
+  default_prompt: "使用 $enterprise-site-pipeline：新环境先运行 bootstrap.ps1，创建技能独立 .venv 并按 requirements.lock.txt 安装锁定依赖和自检；run_local.ps1 缺核心依赖时会自动引导。读取用户提供的本地 Excel。即使没有官网列，也要按企业名称在本机自动多引擎发现官网并抓取候选首页评分；高/中置信度自动采用，低置信度必须由 Codex 打开站点复核。Playwright 优先复用本地包；渲染内核先试内置 Chromium，不可用时自动改用本机 Edge，两者都无才下载 Chromium；抓取默认 auto（静态过薄时自动渲染），内核都不可用时由 Codex 内置浏览器保存 HTML 并以 -HtmlDir 兜底。先小样本 -NoPublish 运行，再让 Codex 自己用图像查看工具逐张核对 review/视觉核对图 下的总览和分类拼版，经 visual_review.py --apply 回写 视觉核对.json，跑 gates.py --require-visual 通过后用 local_pipeline.py --publish-stage 发布。全程在本机执行，不使用 SSH 或远端 worker；MyMemory 429 是可恢复 WARN，英文缺口会写入 英文补译清单.json，默认门禁阻断发布，Codex 必须基于中文事实补 --en 草稿；只有用户明确接受中文版时才可加 --accept-no-english。"
 
 policy:
   allow_implicit_invocation: true

@@ -19,9 +19,9 @@
 $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
 ```
 
-解释器查找顺序：`$env:CODEX_PYTHON` → PATH 里的 `python` → Codex 主运行时
+解释器查找顺序：`$env:CODEX_PYTHON` → 技能目录 `.venv\Scripts\python.exe` → PATH 里的 `python` / `py -3` → Codex 主运行时
 `$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`。
-`run_local.ps1` 会自动完成这个查找，不需要手工指定。
+`run_local.ps1` 会自动完成查找；核心依赖缺失时自动调用 `bootstrap.ps1` 创建技能独立 `.venv`。
 
 脚本默认只依赖：
 
@@ -30,10 +30,10 @@ $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
 - `python-docx`
 - `Pillow`（视觉核对拼版必需；缺失时视觉材料会静默消失，因此列为必需项）
 
-安装方式：`<python.exe> -m pip install -r "$SkillRoot\requirements.txt"`。
+安装方式：先运行 `& "$SkillRoot\bootstrap.ps1"`。它按 `requirements.lock.txt` 安装已验证版本；`requirements.txt` 只提供带主版本上限的可更新范围。
 
 网络请求和 HTML 解析使用标准库，不要求安装 `requests` 或 `beautifulsoup4`。
-`playwright` 是默认正式依赖，用于官网自动发现补搜和 JS 渲染页面。`run_local.ps1` 会优先复用同一 Python 环境里已有的 Playwright；缺失时自动执行 `pip install "playwright>=1.40"`。
+`playwright` 是默认正式依赖，用于官网自动发现补搜和 JS 渲染页面。`run_local.ps1` 会优先复用技能 `.venv` 或当前 Python 环境里已有的 Playwright；缺失时才安装。锁定版本以 `requirements.lock.txt` 为准。
 
 渲染内核按 **内置 Chromium → 本机 Microsoft Edge（`channel=msedge`）→ Edge 绝对路径** 依次自动选择。Windows 自带 Edge，且与 Chromium 同源、渲染能力一致，所以绝大多数新环境**不需要下载 100-200MB 的 Chromium**；只有 Chromium 和 Edge 都不可用时才会执行 `python -m playwright install chromium`。离线或受控环境可用 `-NoPlaywrightInstall` 跳过安装，流水线自动降级为静态抓取。
 
@@ -73,14 +73,14 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 ## 三、运行前检查
 
-0. **先跑环境自检**（新环境、换机器、升级 Codex 后必做）：
+0. **先引导并自检**（新环境、换机器、升级 Codex 后必做）：
 
    ```powershell
    $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
-   python "$SkillRoot\scripts\local_pipeline.py" --selftest --excel "D:\path\企业名录.xlsx"
+   & "$SkillRoot\bootstrap.ps1" -Excel "D:\path\企业名录.xlsx"
    ```
 
-   自检覆盖：Python 依赖（openpyxl / python-docx / Pillow / playwright）、渲染内核可启动性（内置 Chromium 或本机 Edge）、本机出网、MyMemory 中译英连通性、Excel 可读性、前 3 家官网可达性或自动发现结果。任何 `[FAIL]` 都先修再跑全量；内核缺失会提示装 Edge 或下载 Chromium。
+   引导会创建技能独立 `.venv`、按 `requirements.lock.txt` 安装依赖并运行自检。自检覆盖 Python 依赖（openpyxl / python-docx / Pillow / playwright）、渲染内核（内置 Chromium 或本机 Edge）、本机出网、MyMemory 中译英、Excel 可读性、前 3 家官网可达性或自动发现结果。任何 `[FAIL]` 都先修再跑全量。MyMemory 429/限流是 `[WARN]` 可恢复告警，不阻止对新环境的基本判定；正式生成如仍失败，会写 `英文补译清单.json`，由 Codex 补 `--en`。
 1. Excel 第一个工作表包含表头；企业名称列名可用 `企业名称`、`公司名称`、`单位名称` 或 `名称`。
 2. 官网列可选，列名可用 `官网`、`网址`、`网站`、`官网地址`。没有官网列时，脚本会用企业全称和去地域核心名做多引擎搜索，并按域名与公司名共现、站点内容命中综合打分自动发现官网；低/中置信度结果由 Codex 打开候选站点复核后再进入正式交付，不能把低置信度结果直接当事实。
 3. JS 渲染站默认走 `--playwright auto`：普通站先静态抓取，页面内容过薄且本机 Playwright 可用时自动渲染重抓；需要强制渲染用 `on`，离线排障用 `off`。
@@ -105,7 +105,8 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | `--proxy URL` | 使用本机 HTTP(S) 代理 |
 | `--insecure` | 跳过 TLS 校验，仅用于用户明确承认的测试环境 |
 | `--en FILE` | 用人工确认的英文 JSON 覆盖自动翻译 |
-| `--no-translate` | 关闭自动翻译，英文层留空 |
+| `--no-translate` | 关闭自动翻译，英文层留空；默认仍阻断发布 |
+| `--accept-no-english` | 仅由用户明确接受中文版时使用；英文相关门禁降为告警 |
 | `--translate-email MAIL` | 可选，MyMemory 联系邮箱，提高匿名翻译额度 |
 | `--translate-delay SEC` | 每次翻译调用后的间隔秒数，默认 0.2 |
 | `--no-visual-review` | 跳过拼版、图片核对表和 `视觉核对.json` 生成 |
@@ -163,6 +164,8 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 ```
 
 自动英文是机翻草稿，交付时必须标注“自动翻译，待人工核校”，不得当作人工定稿。
+
+MyMemory 429/限流时，自检只给 `[WARN]`；正式生成会在 `<run_id>/英文补译清单.json` 列出问题。默认英文缺失会阻断发布，正常修复路径是 Codex 基于 raw 中文事实生成 `--en` 兼容草稿并重跑。仅在用户在当次对话中明确接受中文版时，才可加 `--accept-no-english` 将英文相关门禁降为告警。
 
 ## 七、视觉核对
 
@@ -232,14 +235,14 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 | 现象 | 先查什么 | 处理 |
 |---|---|---|
-| 找不到 Python 包 | 先跑 `--selftest` 看缺哪一项 | 用 `$env:CODEX_PYTHON` 指定解释器，或 `pip install -r "$SkillRoot\requirements.txt"` |
+| 找不到 Python 包 | 先运行 `bootstrap.ps1` 或 `--selftest` 看缺哪一项 | 用技能 `.venv`，或用 `$env:CODEX_PYTHON` 指定解释器后安装 `requirements.lock.txt` |
 | 视觉核对材料没生成 | `visual_review` 门禁是否报错、Pillow 是否可导入 | 缺失 Pillow 时视觉材料会静默消失；装上 Pillow 后重跑，别把它当"没有疑点" |
 | 门禁通过但发布报错/没发布 | 控制台是否出现"发布目录被占用" | 被占用的 xlsx 关掉后重跑；或直接用自动改发的 `<输出>\publish_<run_id>\` |
 | 门禁红灯但退出码是 0 | 是否用了 `-AllowRed` 或没走 `run_local.ps1` | 去掉 `-AllowRed`，或给 `local_pipeline.py` 显式加 `--strict` |
 | 官网自动发现低/中置信度 | `gates.json` 的 `site_discovery`、`raw/<企业>.json` 的候选与分数 | 由 Codex 打开候选站点核对；确认后补 Excel 官网列或保留确认记录，不把低置信度结果直接当事实 |
 | 图片为空 | 页面是否 JS 渲染、图片是否要求 Referer | 默认保持 `--playwright auto`；`run_local.ps1` 会复用或自动安装 Playwright，仍抓不到再人工补图并标注 |
-| 英文门禁红 | `en.json` 的 `翻译失败`、`en_entry`、`en_ascii`、`product_detail` | 补数据后重跑；MyMemory 持续 429 时，Codex 基于中文事实生成英文草稿并写成 `--en` JSON（保留 `定稿: false`），或让用户提供定稿 |
-| 产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 失败结果不再写入缓存；等限流窗口后直接重跑，或加 `--translate-email <邮箱>`；仍失败则 Codex 补翻为 `--en` 草稿（保留 `定稿: false`、`自动翻译: true`） |
+| 英文门禁红 | `en.json` 的 `翻译失败`、`英文补译清单.json`、`en_entry`、`en_ascii`、`product_detail` | 正常修复是 Codex 基于 raw 中文事实生成 `--en` 草稿并重跑（保留 `定稿: false`、`自动翻译: true`）；只有用户明确接受中文版才加 `--accept-no-english` |
+| 产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 429 在自检中为可恢复 `WARN`；正式生成会写英文补译清单。可稍后重跑、加 `--translate-email`，或由 Codex 补 `--en` 草稿 |
 | 页面抓取慢 | 超时、最大页数、页面数量 | 先小样本，必要时调小 `--max-pages` |
 | 网络请求失败 | 代理、TLS、目标站点限制 | 使用 `--proxy` 或 `--insecure` 仅做明确测试 |
 | 视觉核对红 | `视觉核对.json` 的“不符”/“待核对”条目 | “不符”先重新归类或补图；未回写时由 Codex 看图后写 `review\verdicts.json` 并执行 `visual_review.py --apply`，再用 `gates.py --require-visual` 复核 |
