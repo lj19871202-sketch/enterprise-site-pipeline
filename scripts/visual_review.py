@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""企业官网资料包 · 视觉核对产物生成
+
+为每家企业生成"看图材料"和空结论载体，供 Codex（图像查看）或人工核对：
+
+    <run>/review/视觉核对图/<企业>/0.总览.png      四类速览
+    <run>/review/视觉核对图/<企业>/<分类>.png       分类拼版（全部图片）
+    <run>/review/图片核对表.xlsx                    带缩略图 + 结论下拉
+    <run>/视觉核对.json                             结论载体，供 gates.py 读取
+
+本脚本只负责出材料和占位，不代替人/模型判断图片内容。
+Codex 执行时用图像查看工具打开拼版，把结论写回 视觉核对.json，再跑 gates.py。
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+DIRS = {
+    "factory": "1.企业工厂图",
+    "product": "2.企业产品图",
+    "logo": "3.企业logo",
+    "cert": "4.资质证书",
+}
+LABELS = {
+    "1.企业工厂图": "工厂/车间/厂房/设备",
+    "2.企业产品图": "产品/商品/样品",
+    "3.企业logo": "品牌 logo/标志",
+    "4.资质证书": "证书/资质/荣誉/认证",
+}
+FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+    r"C:\Windows\Fonts\arial.ttf",
+)
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def company_dir_name(name):
+    """与 local_pipeline.safe_filename 保持一致。"""
+    s = re.sub(r"\s+", " ", str(name or "")).strip()
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
+    s = s.strip(" .")
+    return s[:120] or "company"
+
+
+def font(size):
+    from PIL import ImageFont
+    for cand in FONT_CANDIDATES:
+        if os.path.isfile(cand):
+            try:
+                return ImageFont.truetype(cand, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def wrap(draw, text, fnt, max_w, max_lines=2):
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    lines, cur, truncated = [], "", False
+    for ch in text:
+        if draw.textlength(cur + ch, font=fnt) <= max_w:
+            cur += ch
+        else:
+            lines.append(cur)
+            cur = ch
+            if len(lines) >= max_lines:
+                truncated = True
+                break
+    if not truncated and cur and len(lines) < max_lines:
+        lines.append(cur)
+    if truncated and lines:
+        lines[-1] = lines[-1][:-1] + "\u2026"
+    return lines
+
+
+def load_thumb(path, box):
+    from PIL import Image, ImageDraw
+    try:
+        im = Image.open(str(path))
+        im = im.convert("RGBA")
+        # 透明 logo 常见为白色或蓝色单色素材，直接叠白底会“看不见”。
+        # 用浅色棋盘底展示透明通道，同时不影响无透明通道的普通图片。
+        tile = 12
+        bg = Image.new("RGB", im.size, (245, 246, 248))
+        d = ImageDraw.Draw(bg)
+        for yy in range(0, im.height, tile):
+            for xx in range(0, im.width, tile):
+                if ((xx // tile) + (yy // tile)) % 2:
+                    d.rectangle([xx, yy, min(xx + tile - 1, im.width - 1),
+                                 min(yy + tile - 1, im.height - 1)],
+                                fill=(221, 225, 232))
+        bg = bg.convert("RGBA")
+        im = Image.alpha_composite(bg, im).convert("RGB")
+        im.thumbnail(box, Image.LANCZOS)
+        return im
+    except Exception:
+        return None
+
+
+def placeholder(box, text, fnt):
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", box, (240, 241, 245))
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 0, box[0] - 1, box[1] - 1], outline=(200, 204, 214), width=2)
+    lines = wrap(d, text, fnt, box[0] - 30, max_lines=3)
+    y = box[1] // 2 - 10 * len(lines)
+    for line in lines:
+        w = d.textlength(line, font=fnt)
+        d.text(((box[0] - w) / 2, y), line, font=fnt, fill=(110, 114, 124))
+        y += 22
+    d.text((12, 12), "无法预览", font=fnt, fill=(170, 60, 60))
+    return im
+
+
+def build_montage(records, out_path, title, subtitle):
+    from PIL import Image, ImageDraw
+    cols, cell_w, cell_h = 4, 380, 430
+    thumb_w, thumb_h, head = 340, 300, 116
+    rows = max(1, (len(records) + cols - 1) // cols)
+    width = cols * cell_w + 20
+    height = head + rows * cell_h + 20
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    d = ImageDraw.Draw(canvas)
+    tf, cf, sf = font(30), font(17), font(15)
+    d.rectangle([0, 0, width, head], fill=(24, 64, 120))
+    d.text((20, 16), title, font=tf, fill=(255, 255, 255))
+    d.text((20, 68), subtitle, font=sf, fill=(214, 227, 245))
+    for i, rec in enumerate(records):
+        row, col = divmod(i, cols)
+        x, y = 10 + col * cell_w, head + row * cell_h
+        d.rectangle([x + 6, y + 6, x + cell_w - 6, y + cell_h - 6], outline=(208, 213, 224), width=2)
+        im = load_thumb(rec["path"], (thumb_w, thumb_h))
+        if im is None:
+            im = placeholder((thumb_w, thumb_h), rec["file"], cf)
+        px = x + (cell_w - im.width) // 2
+        py = y + 18 + (thumb_h - im.height) // 2
+        canvas.paste(im, (px, py))
+        d.rectangle([px, py, px + im.width, py + im.height], outline=(178, 183, 195), width=1)
+        d.rectangle([x + 16, y + 16, x + 62, y + 50], fill=(204, 42, 42))
+        d.text((x + 30, y + 21), str(i + 1), font=cf, fill=(255, 255, 255))
+        cap_y = y + 18 + thumb_h + 8
+        d.text((x + 18, cap_y), f"{i + 1:02d} {rec['file']}", font=cf, fill=(20, 20, 20))
+        cap_y += 24
+        for line in wrap(d, rec.get("alt") or rec.get("url", ""), sf, cell_w - 40, 2):
+            d.text((x + 18, cap_y), line, font=sf, fill=(92, 97, 108))
+            cap_y += 20
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(str(out_path))
+    canvas.close()
+    return out_path
+
+
+def company_records(deliverable, name, archive):
+    out = {}
+    home = deliverable / company_dir_name(name)
+    for cat, folder in DIRS.items():
+        items = []
+        for i, it in enumerate(archive.get(cat) or [], 1):
+            filename = str(it.get("file", ""))
+            items.append({
+                "idx": i,
+                "folder": folder,
+                "file": filename,
+                "path": home / folder / filename,
+                "alt": str(it.get("alt", "")),
+                "url": str(it.get("url", "")),
+                "from": str(it.get("from", "")),
+                "wh": str(it.get("wh", "")),
+            })
+        out[folder] = items
+    return out
+
+
+def make_review_xlsx(path, records_by_cat):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "图片核对"
+    headers = ["分类", "序号", "文件", "缩略图", "尺寸", "图片URL", "来源页面", "alt", "结论", "说明"]
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        ws.cell(row=1, column=c).font = Font(bold=True)
+
+    tmp = Path(tempfile.mkdtemp(prefix="review_thumb_"))
+    row = 2
+    try:
+        for folder, items in records_by_cat.items():
+            for rec in items:
+                ws.cell(row=row, column=1, value=folder)
+                ws.cell(row=row, column=2, value=rec["idx"])
+                ws.cell(row=row, column=3, value=rec["file"])
+                ws.cell(row=row, column=5, value=rec["wh"])
+                ws.cell(row=row, column=6, value=rec["url"])
+                ws.cell(row=row, column=7, value=rec["from"])
+                ws.cell(row=row, column=8, value=rec["alt"])
+                ws.row_dimensions[row].height = 92
+                im = load_thumb(rec["path"], (120, 120))
+                if im is not None:
+                    thumb = tmp / f"t{row}.png"
+                    im.save(str(thumb))
+                    from openpyxl.drawing.image import Image as XLImage
+                    xl = XLImage(str(thumb))
+                    xl.width, xl.height = 116, 116
+                    ws.add_image(xl, f"D{row}")
+                else:
+                    ws.cell(row=row, column=4, value="无法预览")
+                row += 1
+        last = max(2, row - 1)
+        dv = DataValidation(type="list", formula1='"符合,不符,待核对"', allow_blank=True)
+        ws.add_data_validation(dv)
+        dv.add(f"I2:I{last}")
+        widths = {"A": 16, "B": 6, "C": 26, "D": 18, "E": 10, "F": 40, "G": 40, "H": 24, "I": 10, "J": 30}
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+        ws.freeze_panes = "A2"
+
+        ws2 = wb.create_sheet("文档与产品")
+        ws2.append(["对象", "位置", "核对要点", "结论", "说明"])
+        for c in range(1, 6):
+            ws2.cell(row=1, column=c).font = Font(bold=True)
+        rows = [
+            ["企业介绍 docx", "5.企业介绍/*.docx", "中文简介是否为本企业事实、无导航套话；中英段是否对应", "", ""],
+            ["产品清单 xlsx", "产品清单.xlsx", "每行是否为真实产品；中文名、英文名、产品详情是否中英对应且无空值", "", ""],
+        ]
+        for r in rows:
+            ws2.append(r)
+        dv2 = DataValidation(type="list", formula1='"符合,不符,待核对"', allow_blank=True)
+        ws2.add_data_validation(dv2)
+        dv2.add("D2:D3")
+        for col, w in {"A": 16, "B": 22, "C": 46, "D": 10, "E": 34}.items():
+            ws2.column_dimensions[col].width = w
+        ws2.freeze_panes = "A2"
+        for row_cells in ws.iter_rows():
+            for cell in row_cells:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(path))
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+def build_template(companies_records, existing):
+    out = {}
+    for name, records_by_cat in companies_records.items():
+        prev = existing.get(name) if isinstance(existing.get(name), dict) else {}
+        prev_cats = prev.get("类别") if isinstance(prev.get("类别"), dict) else {}
+        prev_imgs = prev.get("图片") if isinstance(prev.get("图片"), dict) else {}
+        cats, imgs = {}, {}
+        for folder, items in records_by_cat.items():
+            pc = prev_cats.get(folder) if isinstance(prev_cats.get(folder), dict) else {}
+            cats[folder] = {"结论": pc.get("结论", ""), "说明": pc.get("说明", "")}
+            for rec in items:
+                key = f"{folder}/{rec['file']}"
+                pi = prev_imgs.get(key) if isinstance(prev_imgs.get(key), dict) else {}
+                imgs[key] = {"结论": pi.get("结论", ""), "说明": pi.get("说明", "")}
+        doc = prev.get("文档") if isinstance(prev.get("文档"), dict) else {}
+        prod = prev.get("产品清单") if isinstance(prev.get("产品清单"), dict) else {}
+        out[name] = {
+            "类别": cats,
+            "图片": imgs,
+            "文档": {"结论": doc.get("结论", ""), "说明": doc.get("说明", "")},
+            "产品清单": {"结论": prod.get("结论", ""), "说明": prod.get("说明", "")},
+        }
+    return out
+
+
+def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
+    """把 Codex（或人工）看图后给出的结论合并进 视觉核对.json。
+
+    verdicts.json 既可写成 {"企业名": {"类别": {...}, "图片": {...}}}，
+    也可写成 {"核对": {...}}。类别/图片条目支持简写 "符合"。
+    """
+    if not verdicts_path.is_file():
+        raise SystemExit(f"找不到核对结论文件：{verdicts_path}")
+    data = read_json(json_path) if json_path.is_file() else {}
+    payload = read_json(verdicts_path)
+    if isinstance(payload, dict) and isinstance(payload.get("核对"), dict):
+        payload = payload["核对"]
+    applied = 0
+    sections = ("类别", "图片")
+    for name, entry in payload.items():
+        if name.startswith("_") or not isinstance(entry, dict):
+            continue
+        dst = data.setdefault(name, {})
+        for section in sections:
+            block = entry.get(section)
+            if not isinstance(block, dict):
+                continue
+            target = dst.setdefault(section, {})
+            for key, val in block.items():
+                if isinstance(val, str):
+                    val = {"结论": val}
+                if isinstance(val, dict):
+                    clean = {k: v for k, v in val.items() if k in ("结论", "说明")}
+                    if clean:
+                        target.setdefault(key, {}).update(clean)
+                        applied += 1
+        for field in ("文档", "产品清单"):
+            val = entry.get(field)
+            if isinstance(val, str):
+                val = {"结论": val}
+            if isinstance(val, dict):
+                clean = {k: v for k, v in val.items() if k in ("结论", "说明")}
+                if clean:
+                    dst.setdefault(field, {}).update(clean)
+                    applied += 1
+    data["_核对信息"] = {
+        "核对人": reviewer,
+        "核对时间": datetime.datetime.now().isoformat(timespec="seconds"),
+        "写入条数": applied,
+    }
+    write_json(json_path, data)
+    return applied
+
+
+def write_review_guide(path, records_map, review, json_path, gates_cmd):
+    """生成给 Codex 执行的看图核对指引（作为 agent 的必做清单）。"""
+    lines = [
+        "# 视觉核对指引（Codex 必做）",
+        "",
+        "本步骤不能交给用户代做，也不能把结论留成“待核对”后直接发布。",
+        "Codex 必须自己打开下面每个拼版图，逐张判断图片是否属于该企业、是否属于该分类、是否为清晰可用素材。",
+        "",
+        "## 每家企业",
+        "",
+    ]
+    for name, records_by_cat in records_map.items():
+        base = review / "视觉核对图" / company_dir_name(name)
+        total = sum(len(v) for v in records_by_cat.values())
+        lines.append(f"### {name}（{total} 张）")
+        lines.append(f"- 总览：`{base / '0.总览.png'}`")
+        for folder in sorted(records_by_cat):
+            items = records_by_cat[folder]
+            if items:
+                lines.append(f"- {folder}（{len(items)} 张）：`{base / (folder + '.png')}`")
+        lines.append("")
+    lines += [
+        "## 判断口径",
+        "",
+        "- 企业logo：是否为该企业标识；不是则「不符」。",
+        "- 企业工厂图：是否为厂区、车间、产线、办公/园区实景；不是则「不符」。",
+        "- 企业产品图：是否为该企业产品；错图、宣传海报、无关配图则「不符」。",
+        "- 资质证书：是否为该企业资质/证书；模糊到不可辨认或有其他企业名称则「不符」。",
+        "- 文档与产品清单：docx 是否中英双语且无乱码；产品清单行是否为真实产品、图片与产品是否对应。",
+        "- 同一张图跨类别重复且语义不符，判「不符」并在说明里写明。",
+        "",
+        "## 回写格式",
+        "",
+        "把结论写成 verdicts.json（简写也可）：",
+        "",
+        "```json",
+        "{",
+        '  "企业全称": {',
+        '    "类别": {"1.企业工厂图": {"结论": "符合", "说明": "厂区/车间实景"}, "2.企业产品图": {"结论": "符合"}},',
+        '    "图片": {"3.企业logo/01_xxx.png": {"结论": "符合", "说明": ""}},',
+        '    "文档": {"结论": "符合"},',
+        '    "产品清单": {"结论": "符合"}',
+        "  }",
+        "}",
+        "```",
+        "",
+        "## 应用结论",
+        "",
+        "```powershell",
+        f'python "{Path(__file__).resolve()}" --json "{json_path}" --apply "<verdicts.json>"',
+        gates_cmd,
+        "```",
+        "",
+        "任一条「不符」都必须先修数据或补抓再重跑；不要把「不符」改成「待核对」绕过门禁。",
+        "",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="生成企业官网资料包的视觉核对材料")
+    ap.add_argument("--deliverable", default="", help="build/<run_id>/deliverable")
+    ap.add_argument("--raw", default="", help="build/<run_id>/raw")
+    ap.add_argument("--out", default="", help="review 目录，默认 <run>/review")
+    ap.add_argument("--json", dest="json_path", default="", help="视觉核对.json，默认 <run>/视觉核对.json")
+    ap.add_argument("--companies", default="", help="只处理指定企业，逗号分隔")
+    ap.add_argument("--apply", default="", help="把 Codex/人工看图结论 verdicts.json 合并进 视觉核对.json")
+    ap.add_argument("--reviewer", default="Codex", help="核对人名称，默认 Codex")
+    a = ap.parse_args()
+
+    if a.apply:
+        if not a.json_path:
+            raise SystemExit("--apply 需要同时给 --json <视觉核对.json>")
+        json_path = Path(a.json_path).expanduser().resolve()
+        n = apply_verdicts(json_path, Path(a.apply).expanduser().resolve(), a.reviewer)
+        print(f"已写入视觉核对结论 {n} 条：{json_path}")
+        return 0
+
+    if not a.deliverable or not a.raw:
+        raise SystemExit("生成核对材料需要 --deliverable 和 --raw；只回写结论请用 --apply")
+    deliverable = Path(a.deliverable).expanduser().resolve()
+    raw = Path(a.raw).expanduser().resolve()
+    if not deliverable.is_dir():
+        raise SystemExit(f"交付目录不存在：{deliverable}")
+    if not raw.is_dir():
+        raise SystemExit(f"档案目录不存在：{raw}")
+    stage = deliverable.parent
+    review = Path(a.out).expanduser().resolve() if a.out else stage / "review"
+    json_path = Path(a.json_path).expanduser().resolve() if a.json_path else stage / "视觉核对.json"
+    only = {s.strip() for s in a.companies.split(",") if s.strip()}
+
+    archives = {}
+    for fp in sorted(raw.glob("*.json")):
+        try:
+            d = read_json(fp)
+        except Exception as exc:
+            print(f"  ! 跳过无法解析的档案 {fp}: {exc}", file=sys.stderr)
+            continue
+        if d.get("名称") and (not only or d["名称"] in only):
+            archives[d["名称"]] = d
+    if not archives:
+        raise SystemExit("没有可处理的企业档案")
+
+    existing = read_json(json_path) if json_path.is_file() else {}
+    records_map, counts = {}, {}
+    for name, archive in archives.items():
+        records_by_cat = company_records(deliverable, name, archive)
+        records_map[name] = records_by_cat
+        base = review / "视觉核对图" / company_dir_name(name)
+        flat = []
+        for folder, items in records_by_cat.items():
+            counts[(name, folder)] = len(items)
+            flat += items
+            if items:
+                build_montage(
+                    items, base / f"{folder}.png",
+                    f"{name} · {folder}",
+                    f"{LABELS.get(folder, '')} · {len(items)} 张 · Codex 逐张确认是否属于本企业与本分类",
+                )
+        if flat:
+            picks = []
+            for folder, items in records_by_cat.items():
+                for rec in items[:3]:
+                    r2 = dict(rec)
+                    r2["alt"] = f"[{folder}] " + (rec.get("alt") or rec.get("url", ""))
+                    picks.append(r2)
+            build_montage(
+                picks, base / "0.总览.png",
+                f"{name} · 图片总览",
+                f"共 {len(flat)} 张 · 每类最多 3 张速览 · 细看请打开分类拼版",
+            )
+        make_review_xlsx(review / company_dir_name(name) / "图片核对表.xlsx", records_by_cat)
+
+    template = build_template(records_map, existing)
+    write_json(json_path, {
+        "_说明": "结论可填 符合/不符/待核对。Codex 必须打开拼版逐张看图后回写；类别结论非空时，该类未单独填写的图片继承类别结论。",
+        **template,
+    })
+
+    gate_script = Path(__file__).with_name("gates.py")
+    en_file = stage / "en.json"
+    summary_file = stage / "汇总.xlsx"
+    gates_cmd = (f'python "{gate_script}" --deliverable "{deliverable}" --raw "{raw}" '
+                 f'--en "{en_file}" --summary "{summary_file}" '
+                 f'--visual "{json_path}" --require-visual')
+    guide = review / "核对指引.md"
+    write_review_guide(guide, records_map, review, json_path, gates_cmd)
+
+    print(f"企业 {len(archives)} 家")
+    for name in archives:
+        total = sum(counts.get((name, folder), 0) for folder in DIRS.values())
+        print(f"  {name}: 图片 {total} 张")
+        for folder in DIRS.values():
+            print(f"    {folder}: {counts.get((name, folder), 0)} 张")
+    print(f"拼版：{review / '视觉核对图'}")
+    print(f"核对指引：{guide}")
+    print(f"核对表：{review / '<企业>' / '图片核对表.xlsx'}")
+    print(f"结论文件：{json_path}")
+    print("下一步：Codex 打开拼版逐张核对 -> 写 verdicts.json -> --apply -> gates.py --require-visual")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

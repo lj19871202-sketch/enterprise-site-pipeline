@@ -1,0 +1,8 @@
+# enterprise-site-pipeline 运行依赖（Windows 本机 Python）
+# 安装： & <python.exe> -m pip install -r requirements.txt
+# 渲染内核优先复用本机 Edge，无需下载 Chromium；仅 Chromium/Edge 都不可用时才安装：
+# & <python.exe> -m playwright install chromium
+openpyxl>=3.0
+python-docx>=0.8.11
+Pillow>=9.0
+playwright>=1.40

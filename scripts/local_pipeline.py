@@ -1,0 +1,1889 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""本地企业官网资料包流水线。
+
+输入一份 Excel（至少包含企业名称列），在本机完成：
+官网发现 -> 页面抓取 -> 图片归档 -> 中文简介与产品提取 -> docx/xlsx 渲染 -> 门禁。
+
+默认只用 Python 标准库和 openpyxl/python-docx，不依赖 SSH、opencode 或远端 worker。
+Playwright 默认 auto：静态抓取为主，页面过薄或疑似 JS 渲染时自动用 Playwright 重抓。
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as _dt
+import hashlib
+import html as _html
+import json
+import mimetypes
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 CodexLocalPipeline/1.0"
+IMAGE_DIRS = {
+    "factory": "1.企业工厂图",
+    "product": "2.企业产品图",
+    "logo": "3.企业logo",
+    "cert": "4.资质证书",
+}
+SUMMARY_HEADERS = [
+    "企业名称", "官网", "置信度", "处理地", "产业", "规模", "主要业务", "地址",
+    "核心产品", "图片总数", "logo数", "产品图数", "资质图数", "工厂图数",
+    "产品名数", "简介段数", "英文名称", "官网链接", "已生成文件夹",
+]
+PRODUCT_COLUMNS = [
+    "子品类", "排名", "产品名称(中英文)", "品牌", "价格人民币", "价格美金",
+    "产品详情", "图片（本地连接）",
+]
+# 官网没有独立产品详情时，用中英双语事实占位，避免交付表出现空白详情。
+NO_DETAIL_ZH = "官网未提供独立产品详情（分类/系列名）"
+NO_DETAIL_EN = ("No standalone product description is available on the official website "
+                "(category or series name).")
+DETAIL_TAIL = re.compile(r"(?:查看详情|点击查看|了解更多|更多详情|立即咨询|马上咨询)\s*$")
+NOISE = re.compile(
+    r"首页[»>]|您当前的位置|欢迎光临|信息纠错|客服中心|会员级别|顺企|友情链接|"
+    r"荟萃网库|未经核实|询盘|贸易通|立即注册|营业执照号码|技术支持|热门关键词|"
+    r"Powered by|Toggle navigation|Jump to main|Sign in|Read ?more|Copyright|"
+    r"查看详情|点击查看|了解更多|更多详情|立即咨询|马上咨询|"
+    r"ICP备|备案号|版权所有|联系电话|联系方式",
+    re.I,
+)
+SKIP_TAGS = {"script", "style", "noscript", "svg", "template", "iframe"}
+SEARCH_BLOCK = re.compile(
+    r"bing\.com|duckduckgo\.com|baidu\.com|so\.com|sogou\.com|google\.|"
+    r"zhihu\.com|weibo\.com|douyin\.com|xiaohongshu\.com|qcc\.com|tianyancha\.com|"
+    r"1688\.com|alibaba\.com|made-in-china\.com|yellowpages|黄页",
+    re.I,
+)
+# 国内可达性优先：sogou / 360 会把真实结果域名暴露在页面 HTML 文本里，
+# baidu 对无 Cookie 请求多数返回空页，duckduckgo 在部分网络下会被重置连接。
+SEARCH_ENGINES = (
+    ("sogou", "https://www.sogou.com/web?query={q}"),
+    ("so360", "https://www.so.com/s?q={q}"),
+    ("bing", "https://cn.bing.com/search?q={q}"),
+    ("duckduckgo", "https://html.duckduckgo.com/html/?q={q}"),
+)
+# baidu 对无 Cookie 的 urllib 请求常返回空页；Playwright 可用时用它补搜。
+PW_SEARCH_ENGINES = (
+    ("baidu", "https://www.baidu.com/s?wd={q}"),
+    ("bing", "https://cn.bing.com/search?q={q}"),
+)
+DOMAIN_RE = re.compile(
+    r"(?<![0-9a-z@._-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:com\.cn|net\.cn|org\.cn|gov\.cn|edu\.cn|com|cn|net|org|cc|top|vip|"
+    r"tech|site|shop|info|biz|xin|store|online|ltd|group))",
+    re.I,
+)
+JUNK_DOMAIN = re.compile(
+    r"sogou|sogo\.|sgconst|so\.com|360\.|360tres|360sou|360kan|baidu|bing|microsoft|msn\.|"
+    r"weixin|weibo|zhihu|douyin|xiaohongshu|eastmoney|xueqiu|zhipin|"
+    r"qq\.com|live\.com|windowslive|azureedge|akamai|cloudfront|"
+    r"qcc\.|tianyancha|maigoo|co188|10jqka|hao123|"
+    r"google|gstatic|bdstatic|bcebos|qhimg|qpic|qqbrowser|wappass|gtimg|alicdn|"
+    r"sinajs|tanx|mmstat|mediav|qhupdate|"
+    r"window|console|document|prototype|undefined|localhost|w3\.org|json\.org|"
+    r"crockford|github\.com|solib|"
+    r"^[a-z0-9]\.(?:top|com|cn|net|org|info|biz)$",
+    re.I,
+)
+MULTI_TLD = ("com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn")
+
+
+def registrable(host):
+    """取可注册域名，用于去重（www.injet.cn 与 injet.cn 同一个）。"""
+    host = (host or "").lower().strip(".")
+    if not host:
+        return ""
+    parts = host.split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in MULTI_TLD:
+        return ".".join(parts[-3:])
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def harvest_domains(html):
+    """从搜索结果 HTML 里挖出候选域名及出现次数。"""
+    counts = collections.Counter()
+    for m in DOMAIN_RE.finditer(html or ""):
+        d = m.group(1).lower().strip(".")
+        sld = d.split(".")[0]
+        if len(sld) < 3 or JUNK_DOMAIN.search(d):
+            continue
+        reg = registrable(d)
+        if reg and not JUNK_DOMAIN.search(reg):
+            counts[reg] += 1
+    return counts
+
+
+def alt_scheme(url):
+    if url.startswith("https://"):
+        return "http://" + url[len("https://"):]
+    if url.startswith("http://"):
+        return "https://" + url[len("http://"):]
+    return ""
+
+
+def fetch_site(url, args):
+    """抓首页；https 不通时自动回退 http（很多国内企业站只开 http）。"""
+    page, r = fetch_page(url, args)
+    if page:
+        return page, r
+    alt = alt_scheme(url)
+    if alt:
+        page2, r2 = fetch_page(alt, args)
+        if page2:
+            return page2, r2
+    return page, r
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+TRANSLATE_URL = "https://api.mymemory.translated.net/get"
+TRANSLATE_CHUNK = 450
+# MyMemory 匿名查询约 500 字节上限；中文 1 字 ~3 字节，必须按字节而非字符分片。
+TRANSLATE_CHUNK_BYTES = 400
+
+
+def log(*parts):
+    print(*parts, flush=True)
+
+
+def clean_inline(s):
+    return re.sub(r"\s+", " ", _html.unescape(str(s or ""))).strip()
+
+
+def safe_filename(s, fallback="company"):
+    s = clean_inline(s)
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
+    s = s.strip(" .")
+    return s[:120] or fallback
+
+
+def normalize_key(s):
+    return re.sub(r"[\s\W_]+", "", clean_inline(s), flags=re.UNICODE).lower()
+
+
+def core_company_name(name):
+    s = clean_inline(name)
+    s = re.sub(r"（[^）]*(?:原|备注|变更)[^）]*）|\([^)]*(?:原|备注|变更)[^)]*\)", "", s)
+    s = re.sub(r"^(?:四川省?|成都市?|德阳市?|绵阳市?|宜宾市?|泸州市?|乐山市?|眉山市?|资阳市?|遂宁市?|内江市?|南充市?|达州市?|广安市?|巴中市?|雅安市?|攀枝花市?)+", "", s)
+    s = re.sub(r"(?:股份有限公司|有限责任公司|有限公司|集团公司|集团|公司|工厂|厂|研究院|研究所)$", "", s)
+    return s or s.strip("有限公司") or clean_inline(name)
+
+
+def norm_url(url):
+    url = clean_inline(url)
+    if not url:
+        return ""
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    return url
+
+
+def host_of(url):
+    try:
+        return urllib.parse.urlparse(url).netloc.lower().split("@")[-1].split(":")[0]
+    except Exception:
+        return ""
+
+
+def same_site(a, b):
+    ha, hb = host_of(a), host_of(b)
+    return bool(ha and hb and (ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)))
+
+
+def url_category(url, text=""):
+    s = (clean_inline(url) + " " + clean_inline(text)).lower()
+    checks = [
+        ("cert", ("证书", "资质", "荣誉", "认证", "certificate", "honor", "award", "cert")),
+        ("product", ("产品", "商品", "服务", "解决方案", "业务", "product", "service", "solution")),
+        ("factory", ("工厂", "车间", "厂房", "设备", "生产", "基地", "factory", "workshop", "equipment", "plant")),
+        ("about", ("关于", "简介", "公司介绍", "企业介绍", "profile", "about", "company")),
+    ]
+    for cat, words in checks:
+        if any(w in s for w in words):
+            return cat
+    return ""
+
+
+IMG_ALT_NOISE = (
+    "导航", "收起", "展开", "联系", "热线", "电话",
+    "二维码", "扫一扫", "关注", "分享", "客服", "咨询",
+    "返回", "顶部", "底部", "菜单", "首页", "微信", "微博",
+    "公众号", "喜报", "揭牌", "有限公司",
+    "menu", "nav", "close", "more", "back", "qr", "wechat", "weixin", "icon",
+)
+
+
+def image_category(img, page_cat):
+    alt = clean_inline(img.get("alt", ""))
+    s = (clean_inline(img.get("src", "")) + " " + alt).lower()
+    if img.get("bg"):
+        # 背景横幅：仅当出现"关于/公司/厂区"线索时才作为工厂/厂区候选，其余丢弃。
+        if any(w in s for w in ("about", "company", "factory", "plant", "profile",
+                                "工厂", "厂区", "车间", "基地", "公司", "简介")):
+            return "factory"
+        return ""
+    if any(w in s for w in ("logo", "标志", "徽标", "商标", "brand-logo")):
+        return "logo"
+    # 位于指向首页的链接内、且是该链接第一张图：通常是站头 logo。
+    # 部分模板 logo 无 alt 或 alt 恰为公司名，必须在 alt 噪声过滤前判定。
+    if img.get("home_link"):
+        return "logo"
+    if alt and any(w in alt.lower() for w in IMG_ALT_NOISE):
+        return ""
+    if any(w in s for w in ("cert", "证书", "资质", "荣誉", "认证", "award")):
+        return "cert"
+    if any(w in s for w in ("product", "产品", "商品", "goods", "pro_")):
+        return "product"
+    if any(w in s for w in ("factory", "工厂", "车间", "厂房", "设备", "生产", "workshop", "plant")):
+        return "factory"
+    return page_cat if page_cat in ("factory", "product", "cert", "logo") else ""
+
+
+def is_home_href(href):
+    """判断链接是否指向站点首页（用于识别站头 logo 所在的链接）。"""
+    h = clean_inline(href).split("#")[0].split("?")[0].strip().lower()
+    return h in ("/", "./", "./index.html", "index.html", "/index.html")
+
+
+class PageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = []
+        self._title = None
+        self.text = []
+        self.links = []
+        self.images = []
+        self.headings = []
+        self.lists = []
+        self._skip = 0
+        self._a = None
+        self._h = None
+        self._li = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        d = {k.lower(): v for k, v in attrs}
+        if tag in SKIP_TAGS:
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        if tag == "title":
+            self._title = []
+        if tag == "img":
+            src = d.get("src") or d.get("data-src") or d.get("data-original") or d.get("data-lazy-src") or ""
+            if not src and d.get("srcset"):
+                src = d["srcset"].split(",")[0].strip().split(" ")[0]
+            home_link = False
+            if self._a is not None:
+                home_link = (self._a.get("img_count", 0) == 0
+                             and is_home_href(self._a.get("href", "")))
+                self._a["img_count"] = self._a.get("img_count", 0) + 1
+            self.images.append({
+                "src": src, "alt": d.get("alt", ""),
+                "width": d.get("width", ""), "height": d.get("height", ""),
+                "home_link": home_link,
+            })
+        if tag == "a":
+            self._a = {"href": d.get("href", ""), "text": [], "img_count": 0}
+        elif tag in ("h1", "h2", "h3", "h4", "h5"):
+            self._h = {"tag": tag, "text": []}
+        elif tag == "li":
+            self._li = []
+        elif tag == "br" and self._li is not None:
+            self._li.append(" ")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in SKIP_TAGS:
+            if self._skip:
+                self._skip -= 1
+            return
+        if self._skip:
+            return
+        if tag == "a" and self._a is not None:
+            self.links.append({"href": self._a["href"], "text": clean_inline(" ".join(self._a["text"]))})
+            self._a = None
+        elif tag in ("h1", "h2", "h3", "h4", "h5") and self._h is not None:
+            t = clean_inline(" ".join(self._h["text"]))
+            if t:
+                self.headings.append(t)
+            self._h = None
+        elif tag == "li" and self._li is not None:
+            t = clean_inline(" ".join(self._li))
+            if t:
+                self.lists.append(t)
+            self._li = None
+        elif tag == "title" and self._title is not None:
+            t = clean_inline(" ".join(self._title))
+            if t:
+                self.title.append(t)
+            self._title = None
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        s = clean_inline(data)
+        if not s:
+            return
+        self.text.append(s)
+        if self._title is not None:
+            self._title.append(s)
+        if self._a is not None:
+            self._a["text"].append(s)
+        if self._h is not None:
+            self._h["text"].append(s)
+        if self._li is not None:
+            self._li.append(s)
+
+
+def decode_body(body, headers):
+    charset = ""
+    try:
+        charset = headers.get_content_charset() or ""
+    except Exception:
+        pass
+    if not charset:
+        m = re.search(br"charset\s*=\s*[\"']?([A-Za-z0-9._-]+)", body[:8192], re.I)
+        if m:
+            charset = m.group(1).decode("ascii", "ignore")
+    for enc in (charset, "utf-8", "gb18030", "big5"):
+        if not enc:
+            continue
+        try:
+            return body.decode(enc)
+        except Exception:
+            continue
+    return body.decode("utf-8", "replace")
+
+
+def build_opener(proxy="", insecure=False):
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if insecure:
+        handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    return urllib.request.build_opener(*handlers)
+
+
+def fetch(url, args, binary=False, referer=""):
+    url = norm_url(url)
+    headers = {
+        "User-Agent": UA,
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" if binary
+                  else "text/html,application/xhtml+xml,application/xml,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+    }
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with build_opener(args.proxy, args.insecure).open(req, timeout=args.timeout) as resp:
+            body = resp.read(args.max_bytes)
+            return {
+                "url": resp.geturl(), "headers": resp.headers, "body": body,
+                "binary": binary, "status": getattr(resp, "status", ""), "error": "",
+            }
+    except Exception as exc:
+        return {"url": url, "headers": {}, "body": b"", "binary": binary,
+                "status": "", "error": str(exc)}
+
+
+def _byte_clip(text, byte_limit):
+    """截取不超过 byte_limit 个 UTF-8 字节的前缀。"""
+    used, end = 0, 0
+    for idx, ch in enumerate(text):
+        n = len(ch.encode("utf-8"))
+        if used + n > byte_limit:
+            break
+        used += n
+        end = idx + 1
+    return text[:end]
+
+
+def chunk_text(text, limit=TRANSLATE_CHUNK, byte_limit=TRANSLATE_CHUNK_BYTES):
+    """按句子边界切片，每片同时不超过 limit 字符和 byte_limit 个 UTF-8 字节。"""
+    text = clean_inline(text)
+    if not text:
+        return []
+    out, buf = [], ""
+    for sent in re.split(r"(?<=[。！？；!?;])", text):
+        sent = sent.strip()
+        if not sent:
+            continue
+        while len(sent) > limit or len(sent.encode("utf-8")) > byte_limit:
+            clip = _byte_clip(sent, byte_limit)
+            if len(clip) > limit:
+                clip = clip[:limit]
+            if not clip:
+                break
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(clip)
+            sent = sent[len(clip):].strip()
+        if not sent:
+            continue
+        joined = buf + sent
+        if buf and (len(joined) > limit or len(joined.encode("utf-8")) > byte_limit):
+            out.append(buf)
+            buf = sent
+        else:
+            buf = joined
+    if buf:
+        out.append(buf)
+    return out
+
+
+_RATE_LIMIT_UNTIL = 0.0
+_RATE_LIMIT_STREAK = 0
+_RATE_LIMIT_OPEN_UNTIL = 0.0
+_RATE_LIMIT_TRIP = 3
+
+
+def translate_chunk(text, args):
+    """调用 MyMemory 免费接口翻译一段中文；失败返回空串。
+
+    429 限流时做冷却退避；连续多次整条失败后只熔断一个时间窗，窗口过后自动
+    放行探测，避免要么空转十几分钟、要么把整批英文永久丢掉。
+    """
+    global _RATE_LIMIT_UNTIL, _RATE_LIMIT_STREAK, _RATE_LIMIT_OPEN_UNTIL
+    if _RATE_LIMIT_STREAK >= _RATE_LIMIT_TRIP:
+        if time.time() < _RATE_LIMIT_OPEN_UNTIL:
+            return ""
+        _RATE_LIMIT_STREAK = 0      # 冷却窗口已过，重新探测
+    query = urllib.parse.urlencode({"q": text, "langpair": "zh-CN|en"})
+    email = clean_inline(getattr(args, "translate_email", ""))
+    if email:
+        query += "&de=" + urllib.parse.quote(email)
+    pause = _RATE_LIMIT_UNTIL - time.time()
+    if pause > 0:
+        time.sleep(min(pause, 10))
+    for wait in (0, 3.0, 8.0):
+        if wait:
+            time.sleep(wait)
+        r = fetch(f"{TRANSLATE_URL}?{query}", args)
+        err = str(r.get("error") or "")
+        if "429" in err:
+            # 限流是接口级状态，重试本条无意义：记冷却时间后直接判失败。
+            _RATE_LIMIT_UNTIL = time.time() + 10
+            break
+        if err or not r.get("body"):
+            continue
+        try:
+            payload = json.loads(r["body"].decode("utf-8", "replace"))
+        except Exception:
+            continue
+        got = clean_inline((payload.get("responseData") or {}).get("translatedText") or "")
+        if got and "MYMEMORY WARNING" not in got.upper():
+            _RATE_LIMIT_STREAK = 0
+            _RATE_LIMIT_OPEN_UNTIL = 0.0
+            return _html.unescape(got)
+    _RATE_LIMIT_STREAK += 1
+    if _RATE_LIMIT_STREAK >= _RATE_LIMIT_TRIP:
+        _RATE_LIMIT_OPEN_UNTIL = time.time() + 60
+    return ""
+
+
+class Translator:
+    """带磁盘缓存的中译英器，用于自动生成英文草稿。"""
+
+    def __init__(self, args, cache_path=None):
+        self.args = args
+        self.cache_path = Path(cache_path) if cache_path else None
+        self.cache = {}
+        self.fail = 0
+        if self.cache_path and self.cache_path.is_file():
+            try:
+                loaded = json.loads(self.cache_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    # 丢掉历史空结果：一次限流不应被永久固化在缓存里。
+                    self.cache = {k: v for k, v in loaded.items() if v}
+            except Exception:
+                self.cache = {}
+
+    def translate(self, text):
+        text = clean_inline(text)
+        if not text:
+            return ""
+        if not CJK_RE.search(text):
+            return text
+        if text in self.cache:
+            return self.cache[text]
+        parts = [translate_chunk(chunk, self.args) for chunk in chunk_text(text)]
+        ok = [p for p in parts if p]
+        out = clean_inline(" ".join(ok))
+        delay = getattr(self.args, "translate_delay", 0)
+        if len(ok) < len(parts):
+            # 整条或部分失败：不写缓存，下轮重试，避免限流导致英文永久缺失。
+            self.fail += 1
+            if delay:
+                time.sleep(delay)
+            return out
+        self.cache[text] = out
+        if delay:
+            time.sleep(delay)
+        return out
+
+    def save(self):
+        if not self.cache_path:
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_path.write_text(
+                json.dumps(self.cache, ensure_ascii=False, indent=0), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def english_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_inline(text)) if s.strip()]
+
+
+def split_balanced(sents, groups=3):
+    """把句子按字符长度均衡分成 groups 段。"""
+    total = sum(len(s) for s in sents)
+    out, cur, acc = [], [], 0
+    for s in sents:
+        cur.append(s)
+        acc += len(s)
+        if len(out) < groups - 1 and acc >= total * (len(out) + 1) / groups:
+            out.append(" ".join(cur).strip())
+            cur, acc = [], 0
+    if cur:
+        out.append(" ".join(cur).strip())
+    return [p for p in out if p]
+
+
+def build_english_intro(intro_paragraphs, translator, fallback_text=""):
+    """逐段翻译中文简介，保持原来的段落划分；不足三段时再按长度均衡拆分。"""
+    translated = [translator.translate(p) for p in (intro_paragraphs or [])]
+    translated = [t for t in translated if t and not CJK_RE.search(t)]
+    if not translated and fallback_text:
+        got = translator.translate(fallback_text)
+        if got and not CJK_RE.search(got):
+            translated = [got]
+    if len(translated) >= 3:
+        return translated[:3]
+    sents = []
+    for para in translated:
+        sents += english_sentences(para)
+    if len(sents) <= len(translated):
+        return translated
+    return split_balanced(sents, 3)
+
+
+def derive_brand(en_name):
+    """从英文企业名取品牌主体（去掉公司后缀）。"""
+    s = clean_inline(en_name)
+    s = re.sub(r"[,\s]+(?:Co\.?,?\s*)?(?:Ltd\.?|Limited|Inc\.?|LLC|Corp\.?|Corporation|Group|Holdings?)\b.*$",
+               "", s, flags=re.I)
+    s = re.sub(r"\b(?:Group|Holdings?|Company|Co\.?|Ltd\.?|Limited|Inc\.?|LLC|Corp\.?|Corporation)\b",
+               " ", s, flags=re.I)
+    return clean_inline(re.sub(r"\s{2,}", " ", s)).strip(" ,") or clean_inline(en_name)
+
+
+def auto_english_entry(archive, translator):
+    """用自动翻译生成英文层：英文名、英文标题、品牌、三段简介和产品英名。"""
+    en_name = translator.translate(archive.get("名称", ""))
+    en_paras = build_english_intro(
+        archive.get("intro_paragraphs"), translator,
+        fallback_text=clean_inline(archive.get("home_text", ""))[:400])
+    products = archive.get("products") or []
+    product_map = {}
+    for product in products:
+        eng = translator.translate(product)
+        if eng and not CJK_RE.search(eng):
+            product_map[product] = eng
+    detail_map = {}
+    details = archive.get("product_details") or {}
+    for product, detail in details.items():
+        eng = translator.translate(detail)
+        if eng and not CJK_RE.search(eng):
+            detail_map[product] = eng
+    return {
+        "英文名": en_name,
+        "英文标题": en_name,
+        "品牌": derive_brand(en_name),
+        "英文简介": en_paras,
+        "产品英名": product_map,
+        "产品详情英": detail_map,
+        "子品类": archive.get("产业", ""),
+        "定稿": False,
+        "自动翻译": True,
+        "翻译引擎": "MyMemory",
+        "翻译时间": _dt.datetime.now().isoformat(timespec="seconds"),
+        "翻译失败": ((not en_name) or (not en_paras)
+                     or (len(product_map) < len(products))
+                     or (len(detail_map) < len(details))),
+        "备注": "英文为自动翻译草稿，待人工核校",
+    }
+
+
+def empty_english_entry(archive):
+    return {
+        "英文名": "", "英文标题": archive.get("名称", ""), "品牌": "", "英文简介": [],
+        "产品英名": {}, "产品详情英": {}, "子品类": archive.get("产业", ""),
+        "定稿": False, "自动翻译": False, "备注": "未启用自动翻译",
+    }
+
+
+def playwright_status():
+    """本地是否已安装 Playwright Python 包。"""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("playwright") is not None
+    except Exception:
+        return False
+
+
+EDGE_REL = os.path.join("Microsoft", "Edge", "Application", "msedge.exe")
+_BROWSER_CHOICE = None
+
+
+def find_edge():
+    """定位本机 Microsoft Edge；找不到返回空串。"""
+    exe = shutil.which("msedge") or shutil.which("msedge.exe")
+    if exe:
+        return exe
+    roots = [
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("ProgramFiles"),
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("ProgramW6432"),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        cand = os.path.join(root, EDGE_REL)
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def browser_launch_options():
+    """按优先级给出可用的渲染内核：(标签, launch 参数)。
+
+    内置 Chromium -> Edge 稳定通道 -> Edge 绝对路径。
+    Edge 与 Chromium 同源，渲染能力一致，但系统自带、无需下载 100-200MB。
+    """
+    global _BROWSER_CHOICE
+    if _BROWSER_CHOICE is not None:
+        return [_BROWSER_CHOICE]
+    options = [("chromium", {})]
+    edge = find_edge()
+    if edge:
+        options.append(("msedge", {"channel": "msedge"}))
+        options.append(("msedge-exe", {"executable_path": edge}))
+    return options
+
+
+def launch_rendered_browser(p):
+    """启动第一个可用的浏览器内核，返回 (browser, 标签)。"""
+    global _BROWSER_CHOICE
+    last = None
+    for label, kwargs in browser_launch_options():
+        try:
+            browser = p.chromium.launch(headless=True, **kwargs)
+            _BROWSER_CHOICE = (label, kwargs)
+            return browser, label
+        except Exception as exc:
+            last = exc
+    raise RuntimeError("Chromium/Edge 均不可用：" + str(last))
+
+
+def playwright_mode(args):
+    mode = getattr(args, "playwright", "auto")
+    if mode is True:
+        return "on"
+    if mode is False:
+        return "off"
+    mode = str(mode or "auto").lower()
+    return mode if mode in ("auto", "on", "off") else "auto"
+
+
+def playwright_fetch(url, args):
+    """用 Chromium 渲染页面。auto 模式下仅在静态结果过薄时调用。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return {"url": url, "headers": {}, "body": b"", "binary": False,
+                "status": "", "error": f"未安装 Playwright：{exc}"}
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser, _label = launch_rendered_browser(p)
+            page = browser.new_page(locale="zh-CN", user_agent=UA)
+            page.goto(norm_url(url), wait_until="domcontentloaded",
+                      timeout=max(5000, args.timeout * 1000))
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(8000, max(2000, args.timeout * 500)))
+            except Exception:
+                pass
+            page.wait_for_timeout(500)
+            final_url = page.url
+            body = page.content().encode("utf-8")
+            return {"url": final_url, "headers": {}, "body": body, "binary": False,
+                    "status": 200, "error": ""}
+    except Exception as exc:
+        return {"url": url, "headers": {}, "body": b"", "binary": False,
+                "status": "", "error": str(exc)}
+    finally:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+
+
+def parse_page(raw, fallback_url=""):
+    """把一次抓取结果解析成统一 Page 结构；无内容返回 None。"""
+    if not raw or raw.get("error") or not raw.get("body"):
+        return None
+    text = decode_body(raw["body"], raw["headers"])
+    p = PageParser()
+    try:
+        p.feed(text)
+    except Exception:
+        pass
+    page = {
+        "url": raw.get("url") or fallback_url,
+        "title": clean_inline(" ".join(p.title)),
+        "text": clean_inline(" ".join(p.text)),
+        "headings": p.headings,
+        "lists": p.lists,
+        "links": [],
+        "images": [],
+    }
+    base = page["url"] or fallback_url
+    for item in p.links:
+        href = urllib.parse.urljoin(base, item["href"])
+        if href.startswith(("http://", "https://")):
+            page["links"].append({"href": href, "text": item["text"]})
+    for item in p.images:
+        src = urllib.parse.urljoin(base, item["src"].replace("\\", "/"))
+        if src.startswith(("http://", "https://")):
+            item["src"] = src
+            page["images"].append(item)
+    # CSS 背景图不会被 <img> 解析器捕获；首页横幅常以 background-image 方式出现，
+    # 其中"关于/公司/厂区"横幅是工厂图的重要候选来源。
+    seen_src = {item.get("src", "") for item in page["images"]}
+    for m in re.finditer(
+        r"background(?:-image)?\s*:\s*url\(\s*[\"']?([^\"')]+?)[\"']?\s*\)",
+        text, re.I,
+    ):
+        raw_src = clean_inline(m.group(1)).replace("\\", "/")
+        if not raw_src or raw_src.startswith("data:"):
+            continue
+        src = urllib.parse.urljoin(base, raw_src)
+        if src.startswith(("http://", "https://")) and src not in seen_src:
+            seen_src.add(src)
+            page["images"].append({
+                "src": src, "alt": "", "width": "", "height": "",
+                "home_link": False, "bg": True,
+            })
+    return page
+
+
+def page_is_thin(page):
+    """静态 HTML 抓到的正文/链接/图片过少，判断为疑似 JS 渲染页。"""
+    if not page:
+        return True
+    text_len = len(page.get("text") or "")
+    return (text_len < 400 and len(page.get("links") or []) < 5
+            and len(page.get("images") or []) < 3)
+
+
+def norm_key(url):
+    return norm_url(url).rstrip("/").lower()
+
+
+def load_html_overrides(args):
+    """载入 --html-dir 下 Codex 内置浏览器保存的离线 HTML。
+
+    manifest.json 形如 {"https://a.com/": "a.html", ...}。
+    """
+    root = Path(getattr(args, "html_dir", "") or "").expanduser()
+    if not str(getattr(args, "html_dir", "") or "").strip():
+        return {}
+    manifest = root / "manifest.json"
+    if not manifest.is_file():
+        log(f"[html-dir] 未找到 {manifest}，忽略离线页面")
+        return {}
+    try:
+        mapping = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log(f"[html-dir] manifest.json 解析失败：{exc}")
+        return {}
+    out = {}
+    for url, rel in (mapping or {}).items():
+        f = (root / str(rel)).resolve()
+        if f.is_file():
+            out[norm_key(str(url))] = f
+    log(f"[html-dir] 载入 {len(out)} 个离线页面快照")
+    return out
+
+
+def html_override(url, args):
+    """离线快照优先于网络抓取；没有则返回 None。"""
+    overrides = getattr(args, "html_overrides", None) or {}
+    f = overrides.get(norm_key(url))
+    if f is None:
+        return None
+    try:
+        raw = {"url": url, "headers": {}, "body": f.read_bytes(), "binary": False,
+               "status": 200, "error": "", "offline": True}
+    except Exception as exc:
+        log(f"[html-dir] 读取失败 {f}：{exc}")
+        return None
+    page = parse_page(raw, url)
+    if page is None:
+        return None
+    log(f"[html-dir] 使用离线快照：{url}")
+    return page, raw
+
+
+def fetch_page(url, args):
+    """抓页面并解析。
+
+    默认 auto：先静态抓取；结果过薄或失败且本地有 Playwright 时自动重抓。
+    on：强制 Playwright（失败回退静态）；off：只静态抓取。
+    """
+    override = html_override(url, args)
+    if override is not None:
+        return override
+    mode = playwright_mode(args)
+    if mode == "on":
+        raw = playwright_fetch(url, args)
+        page = parse_page(raw, url)
+        if page is not None:
+            return page, raw
+        raw2 = fetch(url, args)
+        page2 = parse_page(raw2, url)
+        return page2, (raw2 if page2 is not None else raw)
+
+    raw = fetch(url, args)
+    page = parse_page(raw, url)
+    if mode == "auto" and playwright_status() and page_is_thin(page):
+        raw2 = playwright_fetch(url, args)
+        page2 = parse_page(raw2, url)
+        if page2 is not None:
+            better = (page is None
+                      or len(page2.get("text") or "") > len(page.get("text") or "") * 1.2
+                      or len(page2.get("images") or []) > len(page.get("images") or [])
+                      or len(page2.get("links") or []) > len(page.get("links") or []))
+            if better:
+                return page2, raw2
+    return page, raw
+
+
+def load_excel(path):
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header = [clean_inline(x) for x in rows[0]]
+    def find_col(words):
+        for i, h in enumerate(header):
+            if any(w in h for w in words):
+                return i
+        return None
+    name_col = find_col(("企业名称", "公司名称", "单位名称", "名称"))
+    site_col = find_col(("官网", "网址", "网站", "官网地址"))
+    has_header = name_col is not None
+    if name_col is None:
+        name_col = 0
+    out = []
+    for r in rows[1:] if has_header else rows:
+        name = clean_inline(r[name_col] if name_col < len(r) else "")
+        if not name:
+            continue
+        site = clean_inline(r[site_col] if site_col is not None and site_col < len(r) else "")
+        out.append({"name": name, "website": site})
+    wb.close()
+    return out
+
+
+def search_candidates(name, args):
+    """多引擎挖掘并按“与公司名共现”加权排序候选官网域名。
+
+    国内网络下 sogou/360 可达性最好；静态结果过少且本机有 Playwright 时，
+    再用 baidu/bing 渲染页补搜。返回按可能性排序的候选 URL。
+    """
+    core = core_company_name(name)
+    aliases = [name] if not core or core == name else [name, core]
+    queries = []
+    for alias in aliases:
+        queries += [f'"{alias}" 官网', f'"{alias}" 官方网站']
+    queries.append(f'"{name}" ICP备案')
+    seen_q = set()
+    queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
+
+    counts = collections.Counter()
+    ctx_counts = collections.Counter()
+    order = {}
+    full_key = normalize_key(name)
+    core_key = normalize_key(core or name)
+
+    def harvest(html, weight=1):
+        hits = harvest_domains(html)
+        for reg, cnt in hits.items():
+            if reg not in order:
+                order[reg] = len(order)
+            counts[reg] += cnt * weight
+        # 域名出现在公司名附近的上下文，权重远高于全页裸域名。
+        for m in DOMAIN_RE.finditer(html or ""):
+            reg = registrable(m.group(1).lower().strip("."))
+            if not reg or JUNK_DOMAIN.search(reg):
+                continue
+            window = normalize_key(html[max(0, m.start() - 220):m.start() + 220])
+            if (full_key and full_key in window) or (core_key and core_key in window):
+                ctx_counts[reg] += 1
+                if reg not in order:
+                    order[reg] = len(order)
+
+    for query in queries[:6]:
+        for _engine, tpl in SEARCH_ENGINES:
+            r = fetch(tpl.format(q=urllib.parse.quote(query)), args)
+            if r.get("error") or not r.get("body"):
+                continue
+            html = decode_body(r["body"], r["headers"])
+            harvest(html)
+            for m in re.finditer(r"https?://([^/\"'\s<>\\]+)", html):
+                host = m.group(1).split("@")[-1].split(":")[0].lower()
+                reg = registrable(host)
+                if reg and len(reg.split(".")[0]) >= 3 and not JUNK_DOMAIN.search(reg):
+                    if reg not in order:
+                        order[reg] = len(order)
+                    counts[reg] += 1
+
+    # 静态搜索覆盖不足时，用 Playwright 补搜（baidu 对无 Cookie 请求基本不可用）。
+    if len(counts) < 3 and playwright_status() and playwright_mode(args) != "off":
+        for query in queries[:2]:
+            for _engine, tpl in PW_SEARCH_ENGINES:
+                r = playwright_fetch(tpl.format(q=urllib.parse.quote(query)), args)
+                if r.get("error") or not r.get("body"):
+                    continue
+                harvest(decode_body(r["body"], r["headers"]), weight=2)
+
+    ranked = sorted(
+        counts,
+        key=lambda d: (-(counts[d] + ctx_counts[d] * 5), order.get(d, 0), d),
+    )
+    return [f"https://{d}/" for d in ranked[:max(1, args.search_candidates)]]
+
+
+def site_score(name, page):
+    """给候选首页打分：公司名命中标题/正文是主证据，联系方式/备案是补强。"""
+    if not page:
+        return 0
+    full = normalize_key(name)
+    core = normalize_key(core_company_name(name))
+    title = normalize_key(page.get("title", ""))
+    text = normalize_key(page.get("text", "")[:30000])
+    score = 0
+    if full and full in title:
+        score = 100
+    elif core and core in title:
+        score = 80
+    elif full and full in text:
+        score = 70
+    elif core and core in text:
+        score = 50
+    if full and full in text and score < 100:
+        score += 10
+    if core and core in text and score < 100:
+        score += 5
+    # 企业官网常见信息：地址/电话/邮箱/备案；命中年份、品牌词也略加分。
+    for pat, bonus in (
+        (r"地址|地\s*址|Address", 5),
+        (r"电话|电\s*话|Tel|Phone", 5),
+        (r"备案|ICP备|蜀ICP", 5),
+        (r"关于我们|公司简介|About\s*Us", 5),
+        (r"版权所有|Copyright", 3),
+    ):
+        if re.search(pat, page.get("text", ""), re.I):
+            score += bonus
+    return min(score, 120)
+
+
+def discover_site(name, provided, args):
+    """确认官网。有官网列时以用户提供为准；否则自动发现并分级置信度。"""
+    if provided:
+        url = norm_url(provided.split(",")[0].strip())
+        page, r = fetch_site(url, args)
+        if page:
+            return {"url": page["url"], "confidence": "用户提供", "page": page, "error": ""}
+        return {"url": url, "confidence": "用户提供", "page": None,
+                "error": r.get("error", "页面不可访问")}
+    candidates = search_candidates(name, args)
+    best = None
+    errors = []
+    for url in candidates:
+        page, r = fetch_site(url, args)
+        if not page:
+            errors.append(f"{url}: {r.get('error', '不可访问')}")
+            continue
+        score = site_score(name, page)
+        if score and (best is None or score > best[0]):
+            best = (score, page, url)
+    if best:
+        score, page, url = best
+        real_url = page.get("url") or url
+        if score >= 80:
+            confidence = "高（自动发现）"
+        elif score >= 50:
+            confidence = "中（自动发现）"
+        else:
+            confidence = "低（自动发现，需复核）"
+        return {"url": real_url, "confidence": confidence, "page": page,
+                "error": "", "score": score}
+    return {"url": "", "confidence": "", "page": None, "error": "; ".join(errors[:3])}
+
+
+def sentence_list(text):
+    text = clean_inline(text)
+    parts = re.split(r"(?<=[。！？!?；;])\s*|。|！|？|;|；", text)
+    out = []
+    for p in parts:
+        p = clean_inline(p)
+        if 12 <= len(p) <= 180 and not NOISE.search(p):
+            out.append(p.rstrip("，,；; ") + "。")
+    return out
+
+
+def extract_products(pages):
+    candidates = []
+    for page in pages:
+        if page.get("cat") not in ("product", ""):
+            continue
+        candidates += page.get("headings", [])
+        candidates += page.get("lists", [])
+        if page.get("cat") == "product":
+            candidates += [x.get("text", "") for x in page.get("links", [])]
+    bad = re.compile(r"首页|关于|联系|导航|更多|查看|登录|注册|搜索|服务热线|在线留言|返回顶部|网站地图|人才招聘|新闻")
+    columns = {"产品中心","行业应用","服务支持","投资者关系","关于我们","联系我们","新闻中心","人才招聘","企业文化","发展历程","资质荣誉","客户案例","解决方案","下载中心","在线留言","网站地图","供应商平台","业务咨询","品牌中心","应用领域","公司简介","企业简介","荣誉资质","客户应用","行业知识","全部","产品展示","新闻资讯","联系方式","招贤纳士","合作伙伴","在线客服","企业风采"}
+    out, seen = [], set()
+    for s in candidates:
+        s = clean_inline(s).strip("·-—| ")
+        s = re.sub(r"[\ue000-\uf8ff]", "", s).strip()
+        if not 2 <= len(s) <= 50 or bad.search(s) or s in columns or NOISE.search(s):
+            continue
+        if re.search(r"电话|邮箱|地址|网址|@|\d{7,}", s):
+            continue
+        key = normalize_key(s)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def product_series(name):
+    """取产品型号的"系列名"前缀，用于匹配首页省略完整型号的详情文本。"""
+    m = re.search(r"^(.+?系列)", clean_inline(name))
+    return m.group(1) if m else ""
+
+
+def extract_product_details(pages, products):
+    """从产品列表卡片链接文本提取"产品名 + 简介"里的简介部分。
+
+    产品列表页的卡片链接通常形如"型号 完整简介 查看详情"，首页则可能只保留
+    "系列名 + 简介"。返回 {产品名: 中文详情}，同一产品保留最长文本。
+    """
+    products = [clean_inline(p) for p in (products or []) if clean_inline(p)]
+    details = {}
+    exact = [(p, normalize_key(p)) for p in products]
+    series = collections.defaultdict(list)
+    for p in products:
+        sp = product_series(p)
+        if sp:
+            series[normalize_key(sp)].append(p)
+
+    def remember(product, detail):
+        detail = clean_inline(detail).strip("：:，,-—·| ")
+        if len(detail) < 12 or NOISE.search(detail):
+            return
+        if len(detail) > len(details.get(product, "")):
+            details[product] = detail
+
+    for page in pages:
+        if page.get("cat") not in ("home", "product"):
+            continue
+        for link in page.get("links", []):
+            text = DETAIL_TAIL.sub("", clean_inline(link.get("text", ""))).strip()
+            if len(text) < 16:
+                continue
+            nkey = normalize_key(text)
+            matched = ""
+            for product, pkey in exact:
+                if pkey and nkey.startswith(pkey) and len(pkey) > len(normalize_key(matched)):
+                    matched = product
+            if matched:
+                remember(matched, text[len(matched):] if text.startswith(matched) else text)
+                continue
+            hits = []
+            for spkey, plist in series.items():
+                if len(spkey) >= 4 and nkey.startswith(spkey):
+                    hits += plist
+            if len(set(hits)) == 1 and hits[0] not in details:
+                remember(hits[0], text)
+    return details
+
+
+def make_intro(pages, products):
+    by_cat = collections.defaultdict(list)
+    for p in pages:
+        by_cat[p.get("cat", "home")].append(p.get("text", ""))
+    overview = sentence_list(" ".join(by_cat.get("about", []) + by_cat.get("home", [])))
+    business = sentence_list(" ".join(by_cat.get("product", [])))
+    all_sent = []
+    for p in pages:
+        all_sent += sentence_list(p.get("text", ""))
+    used = set()
+    paras = []
+    for group in (overview[:2], business[:2]):
+        picked = []
+        for s in group:
+            k = normalize_key(s)
+            if k not in used:
+                used.add(k)
+                picked.append(s)
+        if picked:
+            paras.append(" ".join(picked))
+    if not business and products:
+        paras.append("官网列出的主要产品包括：" + "、".join(products[:10]) + "。")
+    for s in all_sent:
+        k = normalize_key(s)
+        if k not in used and len(paras) < 3:
+            used.add(k)
+            paras.append(s)
+    return paras[:3]
+
+
+def main_business(products, pages):
+    for p in pages:
+        for s in sentence_list(p.get("text", "")):
+            if any(w in s for w in ("主营", "主要从事", "主要生产", "主要产品", "经营范围")):
+                return s[:100]
+    return "、".join(products[:3]) if products else ""
+
+
+def extract_address(pages):
+    for p in pages:
+        for s in sentence_list(p.get("text", "")):
+            if "地址" in s or "坐落" in s or "位于" in s:
+                return s[:120]
+    return ""
+
+
+def guess_industry(text):
+    for word in ("装备制造", "机械", "食品", "化工", "电子", "农业", "生物医药", "建材", "纺织", "新能源"):
+        if word in text:
+            return word
+    return ""
+
+
+def download_images(name, pages, home, args):
+    buckets = {k: [] for k in IMAGE_DIRS}
+    seen_hash = {}
+    total = 0
+    for page in pages:
+        if total >= args.max_images:
+            break
+        page_cat = page.get("cat", "")
+        for img in page.get("images", []):
+            if total >= args.max_images:
+                break
+            cat = image_category(img, page_cat)
+            if not cat:
+                continue
+            src = img.get("src", "")
+            if not src.startswith(("http://", "https://")):
+                continue
+            r = fetch(src, args, binary=True, referer=page.get("url", ""))
+            body = r.get("body") or b""
+            if r.get("error") or not body or len(body) < 512 or len(body) > args.max_image_bytes:
+                continue
+            ct = ""
+            try:
+                ct = (r.get("headers").get_content_type() or "").lower()
+            except Exception:
+                pass
+            if not ct.startswith("image/") and not re.search(r"\.(?:jpe?g|png|gif|webp|bmp|svg)(?:\?|$)", src, re.I):
+                continue
+            # 去重：同一内容只归档一次；产品图例外——同内容不同 alt 允许再存一份，
+            # 以支持官网用同一张照片对应"美标/欧标"这类同图不同名的产品。
+            # 任何情况下都禁止同一内容跨类别重复，避免工厂图/证书图互相串类。
+            digest = hashlib.md5(body).hexdigest()
+            alt_key = normalize_key(img.get("alt", ""))
+            seen = seen_hash.setdefault(digest, {"cats": set(), "alts": set()})
+            if cat != "product":
+                if seen["cats"]:
+                    continue
+                seen["cats"].add(cat)
+            else:
+                if seen["cats"] - {"product"} or alt_key in seen["alts"]:
+                    continue
+                seen["cats"].add("product")
+                seen["alts"].add(alt_key)
+            ext = mimetypes.guess_extension(ct.split(";")[0]) or Path(urllib.parse.urlparse(src).path).suffix.lower()
+            if ext in (".jpe",):
+                ext = ".jpg"
+            if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"):
+                ext = ".jpg"
+            stem = safe_filename(Path(urllib.parse.urlparse(src).path).stem, "image")[:40]
+            folder = home / IMAGE_DIRS[cat]
+            folder.mkdir(parents=True, exist_ok=True)
+            filename = f"{len(buckets[cat]) + 1:02d}_{stem}{ext}"
+            (folder / filename).write_bytes(body)
+            buckets[cat].append({
+                "file": filename, "alt": clean_inline(img.get("alt", "")),
+                "url": src, "from": page.get("url", ""),
+                "wh": "x".join(x for x in (img.get("width", ""), img.get("height", "")) if x),
+            })
+            total += 1
+    return buckets
+
+
+def crawl_company(item, args, out_root):
+    name = item["name"]
+    archive = {
+        "名称": name, "官网": "", "置信度": "", "处理地": "", "产业": "", "规模": "",
+        "主要业务": "", "地址": "", "核心产品": "", "logo": [], "product": [],
+        "cert": [], "factory": [], "pages": [], "products": [], "errors": [],
+        "about_text": "", "product_text": "", "home_text": "", "intro_paragraphs": [],
+        "product_details": {}, "status": "partial", "状态原因": "",
+    }
+    discovered = discover_site(name, item.get("website", ""), args)
+    archive["官网"] = discovered.get("url", "")
+    archive["置信度"] = discovered.get("confidence", "")
+    if discovered.get("error"):
+        archive["errors"].append(discovered["error"])
+    if not discovered.get("url"):
+        archive["status"] = "no_website"
+        archive["状态原因"] = "本地发现与校验未确认官网"
+        return archive
+    home_page = discovered.get("page")
+    if not home_page:
+        home_page, r = fetch_page(archive["官网"], args)
+        if not home_page:
+            archive["status"] = "no_website"
+            archive["状态原因"] = "官网页面不可访问：" + r.get("error", "")
+            return archive
+    pages = [{"cat": "home", **home_page}]
+    archive["home_text"] = home_page.get("text", "")
+
+    def page_kind(url):
+        """detail = 单条产品详情页；index = 分类/列表页（一次带出多个产品）。"""
+        path = urllib.parse.urlparse(url).path.lower()
+        return "detail" if re.search(r"\.(?:html?|php|aspx?|jsp)$", path) else "index"
+
+    def site_links(page):
+        out = []
+        for link in page.get("links", []):
+            url, text = link.get("href", ""), link.get("text", "")
+            if not url or not same_site(url, page.get("url", "")):
+                continue
+            cat = url_category(url, text)
+            if cat:
+                out.append((url, cat, text))
+        return out
+
+    seen = {home_page.get("url", "")}
+    home_links = site_links(home_page)
+    # 产品分类/列表页优先于单条详情页：列表页能一次带出多个产品名、详情与产品图。
+    ordered = ([x for x in home_links if x[1] == "product" and page_kind(x[0]) == "index"]
+               + [x for x in home_links if x[1] != "product"]
+               + [x for x in home_links if x[1] == "product" and page_kind(x[0]) == "detail"])
+    selected = []
+    for url, cat, text in ordered:
+        if url in seen:
+            continue
+        seen.add(url)
+        selected.append((url, cat))
+        if len(selected) >= args.max_pages - 1:
+            break
+    for url, cat in selected:
+        page, r = fetch_page(url, args)
+        if not page:
+            archive["errors"].append(f"{url}: {r.get('error', '不可访问')}")
+            continue
+        page["cat"] = cat
+        pages.append(page)
+        if cat == "about":
+            archive["about_text"] = page.get("text", "")
+        elif cat == "product":
+            archive["product_text"] = page.get("text", "")
+    # 再下钻一层：从已抓产品页补齐叶子分类与产品详情页，分类页优先。
+    extra_index, extra_detail = [], []
+    for page in pages:
+        if page.get("cat") != "product":
+            continue
+        for url, cat, text in site_links(page):
+            if url in seen:
+                continue
+            (extra_index if cat == "product" and page_kind(url) == "index" else extra_detail).append((url, cat))
+    for url, cat in extra_index + extra_detail:
+        if len(pages) >= args.max_pages:
+            break
+        if url in seen:
+            continue
+        seen.add(url)
+        page, r = fetch_page(url, args)
+        if not page:
+            archive["errors"].append(f"{url}: {r.get('error', '不可访问')}")
+            continue
+        page["cat"] = cat
+        pages.append(page)
+    archive["pages"] = [{"cat": p.get("cat", ""), "url": p.get("url", ""), "title": p.get("title", "")} for p in pages]
+    all_products = extract_products(pages)
+    details = extract_product_details(pages, all_products)
+    home = out_root / safe_filename(name)
+    for folder in IMAGE_DIRS.values():
+        (home / folder).mkdir(parents=True, exist_ok=True)
+    buckets = download_images(name, pages, home, args)
+    product_image_keys = [normalize_key(it.get("alt", "")) for it in (buckets.get("product") or [])]
+
+    def has_product_evidence(product):
+        """只有产品详情或产品图 alt 明确佐证的条目才算产品，过滤导航/分类词。"""
+        if product in details:
+            return True
+        pkey = normalize_key(product)
+        if not pkey:
+            return False
+        spkey = normalize_key(product_series(product))
+        for key in product_image_keys:
+            if not key:
+                continue
+            if key == pkey:
+                return True
+            # 系列名允许与图片 alt 互为前缀，避免把"储能系统"这类分类词当产品。
+            if spkey and len(spkey) >= 4 and (key.startswith(spkey) or spkey.startswith(key)):
+                return True
+        return False
+
+    archive["products"] = [p for p in all_products if has_product_evidence(p)]
+    archive["product_details"] = {k: v for k, v in details.items() if k in archive["products"]}
+    archive["intro_paragraphs"] = make_intro(pages, archive["products"])
+    archive["主要业务"] = main_business(archive["products"], pages)
+    archive["产业"] = guess_industry(" ".join(p.get("text", "") for p in pages))
+    archive["地址"] = extract_address(pages)
+    archive["核心产品"] = "、".join(archive["products"][:8])
+    for k, v in buckets.items():
+        archive[k] = v
+    total_images = sum(len(v) for v in buckets.values())
+    if total_images == 0:
+        archive["status"] = "empty_images"
+        archive["状态原因"] = "官网未抓到可归档图片"
+    elif archive["errors"] or len(archive["intro_paragraphs"]) < 3:
+        archive["status"] = "partial"
+        archive["状态原因"] = "抓取存在错误或中文简介不足三段"
+    else:
+        archive["status"] = "ok"
+        archive["状态原因"] = ""
+    return archive
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def make_docx(path, archive, en_entry):
+    from docx import Document
+    doc = Document()
+    title = archive["名称"]
+    if archive.get("主要业务"):
+        title += f"（{archive['主要业务']}）"
+    doc.add_paragraph(title)
+    paras = archive.get("intro_paragraphs") or [archive.get("home_text", "")[:500] or "官网公开信息不足，待补充。"]
+    for p in paras[:3]:
+        doc.add_paragraph(p)
+    if en_entry:
+        for p in (en_entry.get("英文简介") or [])[:3]:
+            if isinstance(p, str) and p.strip():
+                doc.add_paragraph(p.strip())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
+
+
+def product_image_links(archive):
+    """按图片 alt 与产品名匹配，返回 {产品名: [本地相对路径]}。
+
+    匹配优先级：完全一致 > 产品名是 alt 前缀 > 系列名匹配。
+    同一张图可被同系列多个产品共用；一个产品不会拿到多张无关图。
+    """
+    folder = IMAGE_DIRS["product"]
+    candidates = []
+    for item in archive.get("product") or []:
+        file_name = clean_inline(item.get("file", ""))
+        if not file_name:
+            continue
+        candidates.append({"rel": f"{folder}/{file_name}", "key": normalize_key(item.get("alt", ""))})
+    result = {}
+    for product in archive.get("products") or []:
+        pkey = normalize_key(product)
+        spkey = normalize_key(product_series(product))
+        matches = []
+        if pkey:
+            matches = [c for c in candidates if c["key"] == pkey]
+        if not matches and pkey:
+            matches = [c for c in candidates if c["key"] and len(pkey) >= 4 and pkey in c["key"]]
+        if not matches and spkey and len(spkey) >= 4:
+            matches = [c for c in candidates if c["key"] and (spkey in c["key"] or c["key"] in spkey)]
+        if not matches and pkey:
+            matches = [c for c in candidates if c["key"] and len(c["key"]) >= 4 and c["key"] in pkey]
+        rels, seen_rel = [], set()
+        for cand in matches:
+            if cand["rel"] not in seen_rel:
+                seen_rel.add(cand["rel"])
+                rels.append(cand["rel"])
+        result[product] = rels
+    return result
+
+
+def make_product_xlsx(path, archive, en_entry):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "产品清单"
+    ws.append(PRODUCT_COLUMNS)
+    pm = (en_entry or {}).get("产品英名") or {}
+    dm = (en_entry or {}).get("产品详情英") or {}
+    details = archive.get("product_details") or {}
+    brand = clean_inline((en_entry or {}).get("品牌", ""))
+    products = archive.get("products", [])
+    image_links = product_image_links(archive)
+    detail_hit = 0
+    for i, product in enumerate(products, 1):
+        eng = clean_inline(pm.get(product, "")) if isinstance(pm, dict) else ""
+        cell = f"{product} / {eng}" if eng else product
+        zh_detail = clean_inline(details.get(product, ""))
+        en_detail = clean_inline(dm.get(product, "")) if isinstance(dm, dict) else ""
+        if zh_detail:
+            detail_hit += 1
+            detail_cell = f"{zh_detail}\n{en_detail}" if en_detail else zh_detail
+        else:
+            detail_cell = f"{NO_DETAIL_ZH}\n{NO_DETAIL_EN}"
+        links = image_links.get(product) or []
+        img_cell = "\n".join(links) if links else "官网未提供产品图\nNo product image available on the official website"
+        ws.append([archive.get("产业", ""), i, cell, brand, "", "", detail_cell, img_cell])
+        if links:
+            img_cell_obj = ws.cell(row=ws.max_row, column=8)
+            img_cell_obj.hyperlink = links[0]
+            img_cell_obj.font = Font(color="0563C1", underline="single")
+    ws2 = wb.create_sheet("企业说明")
+    ws2.append(["企业名称", "英文名称", "源文件夹", "产品数", "产品详情覆盖", "资料备注", "价格说明"])
+    ws2.append([
+        archive["名称"], (en_entry or {}).get("英文名", ""), safe_filename(archive["名称"]),
+        len(products), f"{detail_hit}/{len(products)}", archive.get("状态原因", ""), "",
+    ])
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.freeze_panes = "A2"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+
+
+def make_summary(path, archives, en_data):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "官网汇总"
+    ws.append(SUMMARY_HEADERS)
+    for a in archives:
+        en = en_data.get(a["名称"], {})
+        ws.append([
+            a["名称"], a.get("官网", ""), a.get("置信度", ""), "", a.get("产业", ""),
+            a.get("规模", ""), a.get("主要业务", ""), a.get("地址", ""), a.get("核心产品", ""),
+            sum(len(a.get(k) or []) for k in IMAGE_DIRS),
+            len(a.get("logo") or []), len(a.get("product") or []), len(a.get("cert") or []),
+            len(a.get("factory") or []), len(a.get("products") or []),
+            len(a.get("intro_paragraphs") or []), en.get("英文名", ""), a.get("官网", ""), "是",
+        ])
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.freeze_panes = "A2"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+
+
+def load_en(path, archives, args=None, cache_path=None):
+    """有 --en 用人工确认稿；否则默认自动翻译生成中英双语草稿。"""
+    if path and Path(path).is_file():
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise SystemExit("英文文件必须是 JSON 对象")
+        for entry in data.values():
+            if isinstance(entry, dict):
+                entry.setdefault("定稿", True)
+        return data
+    if args is None or getattr(args, "no_translate", False):
+        return {a["名称"]: empty_english_entry(a) for a in archives}
+    translator = Translator(args, cache_path)
+    log(f"自动生成英文：{len(archives)} 家（MyMemory 中译英，结果标为待人工核校）")
+    data = {}
+    for i, a in enumerate(archives, 1):
+        entry = auto_english_entry(a, translator)
+        data[a["名称"]] = entry
+        log(f"  英文[{i}/{len(archives)}] {a['名称']} · "
+            f"{'失败' if entry['翻译失败'] else 'ok'} · "
+            f"简介 {len(entry['英文简介'])} 段 · 产品英名 {len(entry['产品英名'])}")
+    translator.save()
+    return data
+
+
+def render_stage(stage, archives, en_data):
+    deliverable = stage / "deliverable"
+    raw_dir = stage / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for a in archives:
+        write_json(raw_dir / (safe_filename(a["名称"]) + ".json"), a)
+    for a in archives:
+        home = deliverable / safe_filename(a["名称"])
+        source_home = stage / "raw_home" / safe_filename(a["名称"])
+        for key, folder in IMAGE_DIRS.items():
+            target = home / folder
+            target.mkdir(parents=True, exist_ok=True)
+            source = source_home / folder
+            if source.is_dir():
+                for image in source.iterdir():
+                    if image.is_file():
+                        shutil.copy2(image, target / image.name)
+        make_docx(home / "5.企业介绍" / f"{safe_filename(a['名称'])}简介（{_dt.date.today():%Y%m%d}短）.docx", a, en_data.get(a["名称"]))
+        make_product_xlsx(home / "产品清单.xlsx", a, en_data.get(a["名称"]))
+    write_json(stage / "en.json", en_data)
+    make_summary(stage / "汇总.xlsx", archives, en_data)
+    return deliverable, raw_dir, stage / "en.json", stage / "汇总.xlsx"
+
+
+def build_visual_review(stage, deliverable, raw_dir):
+    """生成拼版、缩略图核对表和视觉核对.json 结论载体。"""
+    script = Path(__file__).with_name("visual_review.py")
+    if not script.is_file():
+        return None, "找不到 visual_review.py"
+    json_path = stage / "视觉核对.json"
+    cmd = [
+        sys.executable, str(script), "--deliverable", str(deliverable), "--raw", str(raw_dir),
+        "--out", str(stage / "review"), "--json", str(json_path),
+    ]
+    proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    log_text = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
+    (stage / "视觉核对.log").write_text(log_text, encoding="utf-8")
+    if proc.returncode != 0:
+        return None, log_text
+    return json_path, log_text
+
+
+def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=None, require_visual=False):
+    gate = Path(__file__).with_name("gates.py")
+    if not gate.is_file():
+        return None, "找不到 gates.py"
+    cmd = [
+        sys.executable, str(gate), "--deliverable", str(deliverable), "--raw", str(raw_dir),
+        "--en", str(en_path), "--summary", str(summary), "--expected", str(expected),
+        "--json", str(stage / "gates.json"),
+    ]
+    if visual:
+        cmd += ["--visual", str(visual)]
+    if require_visual:
+        cmd += ["--require-visual"]
+    proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    (stage / "gates.log").write_text(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), encoding="utf-8")
+    return proc.returncode == 0, proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
+
+
+def publish(stage, out, run_id, target=None):
+    """把 stage 内容发布到目标目录，返回实际发布目录。
+
+    目标里同名文件被占用（最常见的是上一轮 xlsx 还开在 Excel 中）时，
+    copy 会抛 OSError；此时整批改发到 <out>/publish_<run_id>/，
+    保证“产物已生成且门禁通过”不会因为一个被锁文件整条崩掉。
+    """
+    target = Path(target) if target else out
+    target.mkdir(parents=True, exist_ok=True)
+
+    def copy_all(dest):
+        for item in stage.iterdir():
+            dst = dest / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst)
+
+    try:
+        copy_all(target)
+    except OSError as exc:
+        fallback = out / f"publish_{run_id}"
+        log(f"发布目录被占用（{exc}），改发到：{fallback}")
+        fallback.mkdir(parents=True, exist_ok=True)
+        copy_all(fallback)
+        target = fallback
+    write_json(target / "manifest.json", {
+        "run_id": run_id, "published_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "source_run_dir": str(stage),
+    })
+    return target
+
+
+def run_browser_probe():
+    """打印可用的渲染内核名，供 run_local.ps1 决定是否下载 Chromium。"""
+    if not playwright_status():
+        print("none")
+        return 1
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser, label = launch_rendered_browser(p)
+            browser.close()
+        print(label)
+        return 0
+    except Exception:
+        print("none")
+        return 1
+
+
+def run_selftest(args):
+    """新环境自检：依赖、网络、翻译、可选官网可达性。返回退出码。"""
+    import importlib
+
+    line = "=" * 56
+    print(line)
+    print("enterprise-site-pipeline 环境自检")
+    print(line)
+
+    ok = True
+
+    def probe(label, mod, required=True):
+        nonlocal ok
+        try:
+            m = importlib.import_module(mod)
+            ver = getattr(m, "__version__", "") or ""
+            print(f"  [OK]   {label} {ver}".rstrip())
+        except Exception as exc:
+            tag = "FAIL" if required else "SKIP"
+            print(f"  [{tag}] {label}：{exc}")
+            if required:
+                ok = False
+
+    print("\n[1/4] Python 依赖")
+    probe("openpyxl（Excel 读写）", "openpyxl")
+    probe("python-docx（Word 生成）", "docx")
+    probe("Pillow（视觉核对拼版）", "PIL")
+    probe("playwright（JS 渲染，auto 模式使用）", "playwright", required=False)
+    if playwright_status():
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser, label = launch_rendered_browser(pw)
+                browser.close()
+            if label == "chromium":
+                print("  [OK]   渲染内核：Playwright 内置 Chromium")
+            else:
+                print("  [OK]   渲染内核：本机 Microsoft Edge（无需下载 Chromium）")
+        except Exception as exc:
+            print(f"  [WARN] Playwright 已装但没有可用内核：{exc}")
+            print("         本机装 Edge 即可自动启用；或运行： <python.exe> -m playwright install chromium")
+
+    print("\n[2/4] 网络")
+    for label, url in (("目标官网测试", "https://www.baidu.com/"),
+                       ("MyMemory 翻译接口", TRANSLATE_URL + "?q=test&langpair=zh-CN|en")):
+        r = fetch(url, args)
+        if r.get("error"):
+            print(f"  [FAIL] {label}：{r['error']}")
+            if label.startswith("MyMemory"):
+                ok = False
+        else:
+            print(f"  [OK]   {label}（HTTP {r.get('status') or '?'}）")
+
+    print("\n[3/4] 翻译连通性")
+    got = translate_chunk("企业", args)
+    if got:
+        print(f"  [OK]   中译英可用：企业 → {got}")
+    else:
+        print("  [FAIL] 中译英不可用（MyMemory 限流或网络不通）；"
+              "英文层会留空，可用 --no-translate 或 --en 提供定稿")
+        ok = False
+
+    print("\n[4/4] 输入 Excel 与官网可达性")
+    excel = Path(args.excel).expanduser() if args.excel else None
+    if not excel or not excel.is_file():
+        print("  [SKIP] 未提供 --excel，跳过输入与官网检查")
+    else:
+        try:
+            companies = load_excel(excel)
+        except Exception as exc:
+            companies = []
+            print(f"  [FAIL] 读取 Excel 失败：{exc}")
+            ok = False
+        print(f"  [OK]   读到 {len(companies)} 家企业")
+        no_site = [c["name"] for c in companies if not c.get("website")]
+        if no_site:
+            print(f"  [INFO] {len(no_site)} 家没有官网列，将自动发现："
+                  f"{'、'.join(no_site[:5])}{' 等' if len(no_site) > 5 else ''}")
+        checked = 0
+        for item in companies:
+            if checked >= 3:
+                break
+            checked += 1
+            if item.get("website"):
+                page, r = fetch_site(norm_url(item["website"]), args)
+                if page:
+                    print(f"  [OK]   {item['name']}：官网可访问 {page.get('url')}")
+                else:
+                    print(f"  [FAIL] {item['name']}：官网不可访问 {r.get('error', '')}")
+                    ok = False
+            else:
+                d = discover_site(item["name"], "", args)
+                if d.get("url"):
+                    print(f"  [OK]   {item['name']}：自动发现 {d['url']}"
+                          f"（{d.get('confidence', '')}）")
+                else:
+                    print(f"  [WARN] {item['name']}：自动发现未确认官网"
+                          f"（{d.get('error', '')[:120]}）")
+
+    print("\n" + line)
+    print("自检通过，可以运行流水线。" if ok else "自检未通过，请先修复上面标 FAIL 的项。")
+    print(line)
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="本地企业官网资料包流水线")
+    ap.add_argument("--excel", default="", help="包含企业名称的 Excel 文件")
+    ap.add_argument("--selftest", action="store_true",
+                    help="只做环境自检（依赖/网络/翻译/可选官网可达性）后退出，不跑流水线")
+    ap.add_argument("--out", default="enterprise-site-output", help="本地输出目录")
+    ap.add_argument("--en", default="", help="可选：已确认的英文 JSON")
+    ap.add_argument("--limit", type=int, default=0, help="只处理前 N 家，0=全部")
+    ap.add_argument("--timeout", type=int, default=20, help="单次请求超时秒数")
+    ap.add_argument("--max-bytes", type=int, default=8_000_000, help="单页最大下载字节")
+    ap.add_argument("--max-image-bytes", type=int, default=5_000_000, help="单图最大下载字节")
+    ap.add_argument("--max-pages", type=int, default=20, help="每家企业最多抓取页面数")
+    ap.add_argument("--max-products", type=int, default=60, help="每家企业最多产品名数")
+    ap.add_argument("--max-images", type=int, default=140, help="每家企业最多图片数")
+    ap.add_argument("--search-candidates", type=int, default=8, help="官网发现候选域名数")
+    ap.add_argument("--proxy", default="", help="可选 HTTP(S) 代理")
+    ap.add_argument("--insecure", action="store_true", help="跳过 TLS 证书校验（仅测试环境）")
+    ap.add_argument("--playwright", nargs="?", const="on", default="auto",
+                    choices=["auto", "on", "off"],
+                    help="Playwright 模式：auto=静态过薄时自动渲染（默认），on=强制渲染，off=只用静态")
+    ap.add_argument("--html-dir", dest="html_dir", default="",
+                    help="Codex 内置浏览器保存的离线 HTML 目录（含 manifest.json），网络/内核都不可用时兜底")
+    ap.add_argument("--browser-probe", dest="browser_probe", action="store_true",
+                    help="只探测渲染内核（chromium/msedge/msedge-exe/none）后退出")
+    ap.add_argument("--require-visual", dest="require_visual", action="store_true",
+                    help="视觉核对未完成按门禁 error 处理（推荐：Codex 看图回写结论后再发布）")
+    ap.add_argument("--publish-stage", default="",
+                    help="不重新抓取，把已完成的 build/<run_id> 目录发布到 --out")
+    ap.add_argument("--no-publish", dest="no_publish", action="store_true",
+                    help="门禁通过也不发布，只保留 build/<run_id>（用于先做视觉核对）")
+    ap.add_argument("--strict", action="store_true", help="门禁不通过时返回非零退出码")
+    ap.add_argument("--no-translate", dest="no_translate", action="store_true",
+                    help="关闭自动中英双语，仅输出中文并把英文层留空")
+    ap.add_argument("--translate-email", default="", help="可选：MyMemory 联系邮箱，用于提高匿名额度")
+    ap.add_argument("--translate-delay", type=float, default=0.2, help="每次翻译调用后的间隔秒数")
+    ap.add_argument("--no-visual-review", dest="no_visual_review", action="store_true",
+                    help="跳过图片拼版/核对表和视觉核对.json 生成")
+    args = ap.parse_args()
+
+    if args.browser_probe:
+        return run_browser_probe()
+    if args.publish_stage:
+        stage = Path(args.publish_stage).expanduser().resolve()
+        if not stage.is_dir():
+            raise SystemExit(f"找不到已完成的构建目录：{stage}")
+        out = Path(args.out).expanduser().resolve()
+        published = publish(stage, out, stage.name)
+        log(f"已发布：{published}")
+        return 0
+    if args.selftest:
+        return run_selftest(args)
+    args.html_overrides = load_html_overrides(args)
+    if not args.excel:
+        ap.error("缺少 --excel（仅 --selftest 模式可省略）")
+
+    excel = Path(args.excel).expanduser().resolve()
+    if not excel.is_file():
+        raise SystemExit(f"找不到 Excel：{excel}")
+    out = Path(args.out).expanduser().resolve()
+    run_id = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stage = out / "build" / run_id
+    stage.mkdir(parents=True, exist_ok=True)
+    companies = load_excel(excel)
+    if args.limit:
+        companies = companies[:args.limit]
+    if not companies:
+        raise SystemExit("Excel 中没有可处理的企业名称")
+    log(f"输入 {excel}")
+    log(f"企业 {len(companies)} 家 · 本地输出 {out} · run_id {run_id}")
+    archives = []
+    for i, item in enumerate(companies, 1):
+        log(f"[{i}/{len(companies)}] {item['name']} ...")
+        a = crawl_company(item, args, stage / "raw_home")
+        if args.max_products:
+            a["products"] = (a.get("products") or [])[:args.max_products]
+        archives.append(a)
+        log(f"  {a.get('status')} · 官网 {a.get('官网') or '未确认'} · 图片 {sum(len(a.get(k) or []) for k in IMAGE_DIRS)}")
+    en_data = load_en(args.en, archives, args, out / "_translate_cache.json")
+    deliverable, raw_dir, en_path, summary = render_stage(stage, archives, en_data)
+    visual_path, visual_log = None, ""
+    if not args.no_visual_review:
+        log("生成视觉核对材料（拼版 + 缩略图核对表 + 视觉核对.json）...")
+        visual_path, visual_log = build_visual_review(stage, deliverable, raw_dir)
+        if visual_path:
+            log(f"  视觉核对材料：{stage / 'review'}")
+            log("  请查看拼版后把结论写回 视觉核对.json，再跑 gates.py；未核对项默认告警。")
+        else:
+            log(f"  视觉核对材料生成失败，门禁将按待核对处理：{visual_log.strip()[:300]}")
+    write_json(stage / "manifest.json", {
+        "run_id": run_id, "input": str(excel), "companies": len(archives),
+        "excel": excel.name, "status_counts": dict(collections.Counter(a.get("status", "") for a in archives)),
+        "english_final": bool(args.en),
+        "english_mode": "final" if args.en else ("off" if args.no_translate else "auto"),
+        "visual_review": str(visual_path) if visual_path else "",
+        "visual_review_dir": str(stage / "review") if visual_path else "",
+        "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    })
+    passed, gate_log = run_gates(
+        stage, deliverable, raw_dir, en_path, summary, len(archives), visual_path,
+        require_visual=args.require_visual,
+    )
+    log("\n" + (gate_log or "未运行门禁"))
+    if passed:
+        if args.no_publish:
+            log(f"门禁通过；--no-publish 已启用，未发布，构建目录：{stage}")
+            return 0
+        published = publish(stage, out, run_id)
+        log(f"门禁通过，已发布：{published}")
+        return 0
+    log(f"产物已生成但门禁未全绿：{stage}")
+    log("英文为自动翻译草稿且有门禁项为红：核对 gates.json，必要时加 --en <已确认英文.json> 覆盖或补数据后重跑。")
+    return 1 if args.strict else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
