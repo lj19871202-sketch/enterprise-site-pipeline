@@ -98,7 +98,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 每张图的 `from` 来源页与官网同域；
 - `empty_images` 企业单独列入报告。
 
-图片分类只能靠 URL/alt 关键词和所在页面推测，属启发式，必须进入阶段 6 的视觉核对。
+图片分类只能靠 URL/alt 关键词和所在页面推测，属启发式，必须进入阶段 5 的视觉核对。
 
 ## 阶段 4 · 渲染
 
@@ -123,7 +123,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 产品清单 `图片（本地连接）` 每行要么指向真实本地文件，要么显式标注官网无图；
 - 汇总表行数与输入企业数一致。
 
-## 阶段 6 · 视觉核对
+## 阶段 5 · 视觉核对
 
 渲染后自动生成：
 
@@ -146,7 +146,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 跳过生成用 `--no-visual-review`；要求核对必须完成才发布，用 `gates.py --require-visual`。构建阶段可加 `local_pipeline.py --no-publish`，保证 Codex 先看图再发布。
 
-## 阶段 7 · 门禁与发布
+## 阶段 6 · 门禁与发布
 
 脚本自动调用同目录 `gates.py`：
 
