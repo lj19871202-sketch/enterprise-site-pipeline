@@ -44,6 +44,8 @@ metadata:
 - `5.企业介绍/<企业名>简介（日期短）.docx`
 - `产品清单.xlsx`
 
+企业根目录只允许上述五个文件夹和 `产品清单.xlsx`；五个文件夹内只放直接文件，不得再嵌套子目录。`structure` 门禁会强制检查这一层结构。
+
 ## 核心原则
 
 1. **本地单一入口。** 用 `scripts/local_pipeline.py` 或 `scripts/run_local.ps1` 执行；不要再拆成远端 SSH 命令。

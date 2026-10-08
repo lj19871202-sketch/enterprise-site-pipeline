@@ -31,6 +31,8 @@ DIRS2 = {
     "logo": "3.企业logo",
     "cert": "4.资质证书",
 }
+COMPANY_DIRS = list(DIRS2.values()) + ["5.企业介绍"]
+COMPANY_ROOT_ALLOWED = set(COMPANY_DIRS) | {"产品清单.xlsx"}
 EN_KEYS = ["英文名", "英文标题", "品牌", "英文简介", "产品英名", "子品类"]
 CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff（）【】「」，。！？、；：]")
 LATIN = re.compile(r"[A-Za-z]")
@@ -212,17 +214,43 @@ def gate_coverage(ctx):
 def gate_structure(ctx):
     bad = []
     for name in sorted(ctx["companies"]):
-        home = os.path.join(ctx["deliverable"], name)
+        home = company_path(ctx["deliverable"], name)
         if not os.path.isdir(home):
+            bad.append(f"{name}:缺少企业文件夹")
             continue
-        missing = [d for d in DIRS2.values() if not os.path.isdir(os.path.join(home, d))]
-        if not glob.glob(os.path.join(home, "5.企业介绍", "*.docx")):
+        missing = [d for d in COMPANY_DIRS if not os.path.isdir(os.path.join(home, d))]
+        intro_dir = os.path.join(home, "5.企业介绍")
+        if os.path.isdir(intro_dir) and not glob.glob(os.path.join(intro_dir, "*.docx")):
             missing.append("简介docx")
         if not os.path.isfile(os.path.join(home, "产品清单.xlsx")):
             missing.append("产品清单.xlsx")
         if missing:
             bad.append(f"{name}:{','.join(missing)}")
-    return Gate("structure", "error", not bad, f"{len(bad)} 家结构缺失", bad)
+        extra = [x for x in sorted(os.listdir(home)) if x not in COMPANY_ROOT_ALLOWED]
+        if extra:
+            bad.append(f"{name}:企业根目录多余项 {','.join(extra)}")
+        for folder_name in COMPANY_DIRS:
+            folder = os.path.join(home, folder_name)
+            if not os.path.isdir(folder):
+                continue
+            nested = [
+                x for x in sorted(os.listdir(folder))
+                if os.path.isdir(os.path.join(folder, x))
+            ]
+            if nested:
+                bad.append(f"{name}/{folder_name}:禁止嵌套子目录 {','.join(nested)}")
+    try:
+        root_files = [
+            x for x in sorted(os.listdir(ctx["deliverable"]))
+            if not os.path.isdir(os.path.join(ctx["deliverable"], x))
+        ]
+    except OSError as exc:
+        root_files = [f"无法读取交付根目录：{exc}"]
+    if root_files:
+        bad.append(f"交付根目录多余文件:{','.join(root_files)}")
+    return Gate("structure", "error", not bad,
+                f"{len(bad)} 条结构不符（每家必须为五文件夹+产品清单.xlsx，五文件夹内不得嵌套子目录）",
+                bad)
 
 
 def gate_images(ctx):

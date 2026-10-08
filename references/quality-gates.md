@@ -39,7 +39,7 @@ python "$SkillRoot\scripts\gates.py" `
 |---|---|---|---|
 | `site_discovery` | error/warn | 官网必须发现；自动发现置信度为中/低时由 Codex 打开候选站点复核 | 未发现 0 家；中/低置信度仅告警 |
 | `coverage` | error | 档案、目录、英文、汇总四方企业集合一致，且数量等于 `expected_companies` | 差集为空 |
-| `structure` | error | 每家含四类图目录 + 简介 docx + 产品清单 xlsx | 缺失数 0 |
+| `structure` | error | 每家固定为五文件夹 + 产品清单 xlsx；企业根目录无多余项，五文件夹内只允许直接文件、不得嵌套子目录 | 缺失数 0、多余项 0、嵌套目录 0 |
 | `images` | error | 档案里的图片引用都落到真实文件；交付目录里没有 raw 未记录的孤儿图；跨类重复图；四类图是否全空 | 失效引用 0、孤儿图 0、跨类重复组 0、四类全空 0 家 |
 | `image_required` | warn | 单独检查 `logo` 与 `factory` 两类是否有图；官网确实没有素材时保留告警并写数据边界，不硬性阻断 | 空类 0 条（否则告警） |
 | `image_provenance` | error | 每张图的来源页必须与官网同域；图片直链外域单独列出 | 来源页非官网 0 条（直链外域仅提示） |
