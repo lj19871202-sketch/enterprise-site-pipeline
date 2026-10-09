@@ -260,7 +260,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | 官网自动发现低/中置信度 | `gates.json` 的 `site_discovery`、`raw/<企业>.json` 的候选与分数 | 由 Codex 打开候选站点核对；确认后补 Excel 官网列或保留确认记录，不把低置信度结果直接当事实 |
 | 图片为空 | 页面是否 JS 渲染、图片是否要求 Referer | 默认保持 `--playwright auto`；`run_local.ps1` 会复用或自动安装 Playwright，仍抓不到再人工补图并标注 |
 | 英文门禁红 | `en.json` 的 `翻译失败`、`英文补译清单.json`、`en_entry`、`en_ascii`、`product_detail` | 正常修复是 Codex 基于 raw 中文事实生成 `--en` 草稿并重跑（保留 `定稿: false`、`自动翻译: true`）；只有用户明确接受中文版才加 `--accept-no-english` |
-| 产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 429 在自检中为可恢复 `WARN`；正式生成会写英文补译清单。可稍后重跑、加 `--translate-email`，或由 Codex 补 `--en` 草稿 |
+| 非空产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 429 在自检中为可恢复 `WARN`；正式生成会写英文补译清单。可稍后重跑、加 `--translate-email`，或由 Codex 补 `--en` 草稿；来源本来无详情时应留空，不算英文缺口 |
 | 页面抓取慢 | 超时、最大页数、页面数量 | 先小样本，必要时调小 `--max-pages` |
 | 网络请求失败 | 代理、TLS、目标站点限制 | 使用 `--proxy` 或 `--insecure` 仅做明确测试 |
 | 视觉核对红 | `视觉核对.json` 的“不符”/“待核对”条目 | “不符”先重新归类或补图；未回写时由 Codex 看图后写 `review\verdicts.json` 并执行 `visual_review.py --apply`，再用 `gates.py --require-visual` 复核 |

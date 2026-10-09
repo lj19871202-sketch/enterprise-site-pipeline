@@ -52,10 +52,6 @@ PRODUCT_COLUMNS = [
     "子品类", "排名", "产品名称(中英文)", "品牌", "价格人民币", "价格美金",
     "产品详情", "图片（本地连接）",
 ]
-# 官网没有独立产品详情时，用中英双语事实占位，避免交付表出现空白详情。
-NO_DETAIL_ZH = "官网未提供独立产品详情（分类/系列名）"
-NO_DETAIL_EN = ("No standalone product description is available on the official website "
-                "(category or series name).")
 DETAIL_TAIL = re.compile(r"(?:查看详情|点击查看|了解更多|更多详情|立即咨询|马上咨询)\s*$")
 NOISE = re.compile(
     r"首页[»>]|您当前的位置|欢迎光临|信息纠错|客服中心|会员级别|顺企|友情链接|"
@@ -625,7 +621,8 @@ def auto_english_entry(archive, translator):
             product_map[product] = eng
     detail_map = {}
     details = archive.get("product_details") or {}
-    for product, detail in details.items():
+    detail_items = [(p, clean_inline(d)) for p, d in details.items() if clean_inline(d)]
+    for product, detail in detail_items:
         eng = translator.translate(detail)
         if eng and not CJK_RE.search(eng):
             detail_map[product] = eng
@@ -643,7 +640,7 @@ def auto_english_entry(archive, translator):
         "翻译时间": _dt.datetime.now().isoformat(timespec="seconds"),
         "翻译失败": ((not en_name) or (not en_paras)
                      or (len(product_map) < len(products))
-                     or (len(detail_map) < len(details))),
+                     or (len(detail_map) < len(detail_items))),
         "备注": "英文为自动翻译草稿，待人工核校",
     }
 
@@ -665,10 +662,11 @@ def english_backlog(archives, en_data):
         entry = en_data.get(name) or {}
         products = archive.get("products") or []
         details = archive.get("product_details") or {}
+        detail_source = {p: clean_inline(d) for p, d in details.items() if clean_inline(d)}
         product_en = entry.get("产品英名") if isinstance(entry.get("产品英名"), dict) else {}
         detail_en = entry.get("产品详情英") if isinstance(entry.get("产品详情英"), dict) else {}
         missing_products = [p for p in products if not clean_inline(product_en.get(p, ""))]
-        missing_details = [p for p in details if not clean_inline(detail_en.get(p, ""))]
+        missing_details = [p for p in detail_source if not clean_inline(detail_en.get(p, ""))]
         paras = entry.get("英文简介") if isinstance(entry.get("英文简介"), list) else []
         problems = []
         if entry.get("翻译失败") is True:
@@ -1632,7 +1630,9 @@ def _docs_to_facts(doc_texts):
                     continue
                 seen_product.add(k)
                 products.append(name)
-                details.setdefault(name, line[:200])
+                # 产品名/型号行本身不是详情；只有行内确有额外描述时才记录。
+                if normalize_key(line) != normalize_key(name):
+                    details.setdefault(name, line[:200])
     return intro, products, details
 
 
@@ -2012,7 +2012,7 @@ def make_product_xlsx(path, archive, en_entry):
             detail_hit += 1
             detail_cell = f"{zh_detail}\n{en_detail}" if en_detail else zh_detail
         else:
-            detail_cell = f"{NO_DETAIL_ZH}\n{NO_DETAIL_EN}"
+            detail_cell = ""
         links = image_links.get(product) or []
         if links:
             img_cell = "\n".join(links)

@@ -337,7 +337,7 @@ def make_review_xlsx(path, records_by_cat):
             ws2.cell(row=1, column=c).font = Font(bold=True)
         rows = [
             ["企业介绍 docx", "5.企业介绍/*.docx", "中文简介是否为本企业事实、无导航套话；中英段是否对应", "", ""],
-            ["产品清单 xlsx", "产品清单.xlsx", "每行是否为真实产品；中文名、英文名、产品详情是否中英对应且无空值", "", ""],
+            ["产品清单 xlsx", "产品清单.xlsx", "每行是否为真实产品；中文名、英文名必填；产品详情非空时中英对应，来源无详情时留空", "", ""],
         ]
         for r in rows:
             ws2.append(r)

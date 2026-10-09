@@ -430,9 +430,9 @@ def gate_product_en(ctx):
 
 
 def gate_product_detail(ctx):
-    """产品详情列必须中英双语；官网真实详情覆盖率作为告警指标。"""
+    """产品详情非空时必须中英双语；来源无详情时留空，真实详情覆盖率作为告警指标。"""
     import openpyxl
-    bad, empty, total, hit = [], 0, 0, 0
+    bad, blank, total, hit = [], 0, 0, 0
     for fp in glob.glob(os.path.join(ctx["deliverable"], "*", "产品清单.xlsx")):
         name = os.path.basename(os.path.dirname(fp))
         try:
@@ -446,22 +446,26 @@ def gate_product_detail(ctx):
             text = norm_text(row[col] if col < len(row) else None)
             total += 1
             if not text:
-                empty += 1
+                blank += 1
                 continue
-            if not CJK.search(text):
+            if ("官网未提供独立产品详情" in text
+                    or "No standalone product description" in text):
+                bad.append(f"{name} 行{r}: 来源无详情时应留空，不应使用旧占位文字")
+            elif not CJK.search(text):
                 bad.append(f"{name} 行{r}: 详情缺中文")
             elif not EN_SENTENCE.search(text):
                 bad.append(f"{name} 行{r}: 详情缺英文译文（机翻失败；清 _translate_cache.json 后重跑）")
-            elif "官网未提供独立产品详情" not in text and "No standalone product description" not in text:
+            else:
                 hit += 1
     coverage = hit / total if total else 1.0
     if bad:
         return Gate("product_detail", english_gate_level(ctx), False,
                     f"{len(bad)} 行产品详情不完整", bad)
-    ok = (not empty) and coverage >= ctx.get("detail_min", 0.30)
-    detail = (f"中英双语 {total - empty}/{total} 行；官网独立详情覆盖 {coverage:.0%}"
-              f"（其余为分类/系列名双语占位说明）")
-    offenders = [f"空详情 {empty} 行"] if empty else []
+    threshold = ctx.get("detail_min", 0.30)
+    ok = coverage >= threshold
+    detail = (f"真实产品详情 {hit}/{total} 行；来源无详情留空 {blank} 行；"
+              f"真实详情覆盖 {coverage:.0%}")
+    offenders = [] if ok else [f"真实详情覆盖 {coverage:.0%} 低于 {threshold:.0%}"]
     return Gate("product_detail", "warn", ok, detail, offenders)
 
 
@@ -747,7 +751,7 @@ def main():
     ap.add_argument("--ascii-max", type=float, default=None, help="英文段非ASCII占比上限")
     ap.add_argument("--pinyin-max", type=float, default=None, help="疑似拼音占比告警线")
     ap.add_argument("--map-min", type=float, default=None, help="产品英名覆盖率下限")
-    ap.add_argument("--detail-min", type=float, default=None, help="官网独立产品详情覆盖率告警线")
+    ap.add_argument("--detail-min", type=float, default=None, help="官网/用户资料真实产品详情覆盖率告警线")
     a = ap.parse_args()
 
     cfg = {}
