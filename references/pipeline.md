@@ -3,8 +3,11 @@
 入口脚本：
 
 ```text
-scripts/local_pipeline.py
-scripts/run_local.ps1
+scripts/local_pipeline.py      # 主流水线
+scripts/run_local.ps1          # PowerShell 包装脚本
+scripts/visual_review.py       # 拼版、图片核对表、核对指引、结论回写
+scripts/session_guard.py        # 看图前查会话 rollout 体积（>20MB 提示另开会话）
+scripts/gates.py               # 质量门禁
 ```
 
 脚本在 Codex 当前本机执行，输入 Excel，输出企业官网资料包。不要把这套流程拆成远端会话或手工多机复制。新环境先运行 `bootstrap.ps1` 创建技能独立 `.venv`，并按 `requirements.lock.txt` 安装锁定依赖（需联网；已在无 `.venv` 的干净克隆上实测通过）。
@@ -156,12 +159,12 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 <run_id>/视觉核对.json
 ```
 
-流程由 Codex 自己执行，不得推给用户。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），因此必须在短线程内分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。
+流程由 Codex 自己执行，不得推给用户。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），因此必须在短线程内分批：每批 ≤10 家，一个会话做完「查体积 → 看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。开工前先跑 `scripts/session_guard.py`，rollout 超过 20MB 先换会话。
 
 步骤：
 
-1. Codex 打开 `review/核对指引.md`，按绝对路径逐家看图；
-2. 打开 `0.总览.png` 做初筛，疑点打开 `<分类>.png`（分页时 `<分类>_p1.png`、`_p2.png`… 都要看）放大确认；同时核对简介 docx 和产品清单与原始页面是否一致；
+1. Codex 先跑 `scripts/session_guard.py` 查会话体积（>20MB 换会话），再打开 `review/核对指引.md`，按绝对路径逐家看图；
+2. 图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt），按指引的序号范围打开对应 `<分类>_pN.png` 放大确认；图片少时打开 `0.总览.png` 初筛、疑点再看分类拼版。同时核对简介 docx 和产品清单与原始页面是否一致；
 3. 把结论写进 `review/verdicts.json`，执行 `visual_review.py --json "<run_id>/视觉核对.json" --apply "<run_id>/review/verdicts.json" --reviewer Codex` 回写；
 4. 执行 `gates.py --require-visual` 复核，全绿后用 `local_pipeline.py --publish-stage "<run_id>" --out "<输出目录>"` 发布。
 

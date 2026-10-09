@@ -145,9 +145,11 @@ build/<run_id>/review/<企业>/图片核对表.xlsx           # 带缩略图，�
 build/<run_id>/视觉核对.json                           # 结论载体
 ```
 
-这一步由 Codex 自己做，不能把拼版甩给用户代看。Codex 先用图像查看工具打开总览初筛，再逐个打开分类拼版放大核对（分页时同一分类的所有页都要看）；读 `review/核对指引.md` 获取当前运行的企业、拼版绝对路径和 JSON 模板。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以必须短线程分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。结论写成 `verdicts.json` 后一键回写：
+这一步由 Codex 自己做，不能把拼版甩给用户代看。开工前先跑 `python "$SkillRoot\scripts\session_guard.py"` 查本会话 rollout 体积，超过 20MB 先另开会话。然后读 `review/核对指引.md`：图片多时先用 `图片核对表.xlsx` 初筛，按指引标注的**序号范围**只打开可疑的 `<分类>_pN.png` 放大确认（同一分类被点名的页都要看）。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以必须短线程分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。结论写成 `verdicts.json` 后一键回写：
 
 ```powershell
+# 看图前先查会话体积（>20MB 先另开会话）
+python "$SkillRoot\scripts\session_guard.py"
 python "$SkillRoot\scripts\visual_review.py" `
   --json "<输出目录>\build\<run_id>\视觉核对.json" `
   --apply "<verdicts.json>"

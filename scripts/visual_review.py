@@ -147,6 +147,22 @@ def page_index(path):
     return int(m.group(1)) if m else 1
 
 
+def seq_range(page):
+    """该页图片在所属分类内的序号范围，与图片核对表的「序号」列一致。"""
+    if not page:
+        return 0, 0
+    return (page[0].get("idx", 1), page[-1].get("idx", len(page)))
+
+
+def page_note(page, index, total, grand_total):
+    """分页时的页眉说明；单页不写，避免和总览混淆。"""
+    if total <= 1:
+        return ""
+    first, last = seq_range(page)
+    span = str(first) if first == last else f"{first}-{last}"
+    return f"第 {index + 1} / {total} 页 · 序号 {span} · 共 {grand_total} 张"
+
+
 def _render_montage_page(records, out_path, title, subtitle, page_note=""):
     from PIL import Image, ImageDraw
     cols, cell_w, cell_h = 4, 380, 430
@@ -173,10 +189,13 @@ def _render_montage_page(records, out_path, title, subtitle, page_note=""):
         py = y + 18 + (thumb_h - im.height) // 2
         canvas.paste(im, (px, py))
         d.rectangle([px, py, px + im.width, py + im.height], outline=(178, 183, 195), width=1)
+        # 角标与标题都用「该分类内的序号」，与图片核对表的「序号」列一一对应，
+        # 便于先用核对表初筛、再按序号只打开相关拼版页。
+        no = rec.get("idx", i + 1)
         d.rectangle([x + 16, y + 16, x + 62, y + 50], fill=(204, 42, 42))
-        d.text((x + 30, y + 21), str(i + 1), font=cf, fill=(255, 255, 255))
+        d.text((x + 30, y + 21), str(no), font=cf, fill=(255, 255, 255))
         cap_y = y + 18 + thumb_h + 8
-        d.text((x + 18, cap_y), f"{i + 1:02d} {rec['file']}", font=cf, fill=(20, 20, 20))
+        d.text((x + 18, cap_y), f"{no:02d} {rec['file']}", font=cf, fill=(20, 20, 20))
         cap_y += 24
         for line in wrap(d, rec.get("alt") or rec.get("url", ""), sf, cell_w - 40, 2):
             d.text((x + 18, cap_y), line, font=sf, fill=(92, 97, 108))
@@ -191,7 +210,9 @@ def build_montage(records, out_path, title, subtitle,
                   max_cells=MAX_CELLS_PER_PAGE, max_bytes=MAX_PAGE_BYTES):
     """生成拼版图；单页超过 max_cells 张或 max_bytes 字节时自动分页。
 
-    返回写出的文件路径列表。单页沿用 out_path；分页时写成
+    返回每页信息列表（``path`` / ``first`` / ``last`` / ``count``）；
+    ``first``、``last`` 是该页图片在本分类内的序号范围，与图片核对表的
+    「序号」列一致。单页沿用 out_path；分页时写成
     ``<名称>_p1.png``、``<名称>_p2.png``…… 顺序与 records 一致。
     分页是为了让 Codex 逐页看图时不会把超大拼版读进会话（历史事故：
     146 张的产品拼版单张 13.6MB）。常规情况每页只渲染一次；只有某页
@@ -216,7 +237,7 @@ def build_montage(records, out_path, title, subtitle,
                 tmp_file = tmp_dir / f"{i:03d}{out_path.suffix}"
                 _render_montage_page(
                     page, tmp_file, title, subtitle,
-                    f"第 {i + 1} / {total} 页（共 {len(records)} 张）" if total > 1 else "")
+                    page_note(page, i, total, len(records)))
                 page_files.append(tmp_file)
             oversized = [i for i, tmp_file in enumerate(page_files)
                          if tmp_file.stat().st_size > max_bytes and len(pages[i]) > 1]
@@ -228,15 +249,17 @@ def build_montage(records, out_path, title, subtitle,
                 pages[i:i + 1] = [page[:half], page[half:]]
 
         total = len(pages)
-        paths = []
+        result = []
         for i, tmp_file in enumerate(page_files):
             dst = out_path if total == 1 else out_path.with_name(
                 f"{out_path.stem}_p{i + 1}{out_path.suffix}")
             if dst.exists():
                 dst.unlink()
             shutil.move(str(tmp_file), str(dst))
-            paths.append(dst)
-        return paths
+            first, last = seq_range(pages[i])
+            result.append({"path": dst, "first": first, "last": last,
+                           "count": len(pages[i])})
+        return result
     finally:
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
@@ -407,14 +430,27 @@ def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
     return applied
 
 
-def write_review_guide(path, records_map, review, json_path, gates_cmd):
+def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_map=None):
     """生成给 Codex 执行的看图核对指引（作为 agent 的必做清单）。"""
+    pages_map = pages_map or {}
+    guard = Path(__file__).with_name("session_guard.py")
     lines = [
         "# 视觉核对指引（Codex 必做）",
         "",
         "本步骤不能交给用户代做，也不能把结论留成“待核对”后直接发布。",
-        "Codex 必须自己打开下面每个拼版图，逐张判断图片是否属于该企业、是否属于该分类、是否为清晰可用素材。",
-        "必须在短线程内完成：每批 ≤10 家，一个会话只做「看图 → 回写结论 → 跑门禁 → 发布」，做完即止，不要在长会话里累积几十张拼版图片。",
+        "Codex 必须自己看图判断图片是否属于该企业、是否属于该分类、是否为清晰可用素材。",
+        "必须在短线程内完成：每批 ≤10 家，一个会话只做「看图 → 回写结论 → 跑门禁 → 发布」，做完即止。",
+        "开工前先查本会话 rollout 体积，超过 20MB 就另开会话再继续（拼版图会以 base64 留在会话历史里）：",
+        "",
+        "```powershell",
+        f'python "{guard}"',
+        "```",
+        "",
+        "## 大批量初筛（图片多时优先）",
+        "",
+        "- 图片多的企业先用同目录的 `图片核对表.xlsx` 初筛：每行一张图，对着 分类/序号/尺寸/图片URL/来源页面/alt 找可疑项。",
+        "- 用下面的「序号范围」定位可疑序号所在的拼版页，只打开这些页做放大确认；整类看不出疑点的可直接给类别结论。",
+        "- 初筛只是先导，不能代替结论：初筛点名的行必须逐张给出结论，`视觉核对.json` 里不能留下未填的「待核对」。",
         "",
         "## 每家企业",
         "",
@@ -429,15 +465,20 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd):
             items = records_by_cat[folder]
             if not items:
                 continue
-            pages = sorted(base.glob(f"{folder}*.png"), key=page_index)
-            lines.append(f"- {folder}（{len(items)} 张，{len(pages)} 页）：")
-            for page_path in pages:
-                lines.append(f"    - `{page_path}`")
+            pages = pages_map.get((name, folder)) or []
+            if pages:
+                lines.append(f"- {folder}（{len(items)} 张，{len(pages)} 页）：")
+                for page in pages:
+                    span = (str(page["first"]) if page["first"] == page["last"]
+                            else f"{page['first']}-{page['last']}")
+                    lines.append(f"    - 序号 {span}（{page['count']} 张）：`{page['path']}`")
+            else:
+                lines.append(f"- {folder}（{len(items)} 张）：`{base / (folder + '.png')}`")
         lines.append("")
     lines += [
         "## 看图范围",
         "",
-        "- 分类拼版单页最多 12 张；图片多时文件名为 `<分类>_p1.png`、`<分类>_p2.png`……同一分类的所有页都必须看完，不能只打开第 1 页。",
+        "- 分类拼版单页最多 12 张、≤1MB；图片多时写成 `<分类>_p1.png`、`<分类>_p2.png`……按序号分页。初筛点名的页必须逐页打开；整类无疑点时可直接给类别结论。",
         "",
         "## 判断口径",
         "",
@@ -522,7 +563,7 @@ def main():
         raise SystemExit("没有可处理的企业档案")
 
     existing = read_json(json_path) if json_path.is_file() else {}
-    records_map, counts = {}, {}
+    records_map, counts, pages_map = {}, {}, {}
     for name, archive in archives.items():
         records_by_cat = company_records(deliverable, name, archive)
         records_map[name] = records_by_cat
@@ -532,7 +573,7 @@ def main():
             counts[(name, folder)] = len(items)
             flat += items
             if items:
-                build_montage(
+                pages_map[(name, folder)] = build_montage(
                     items, base / f"{folder}.png",
                     f"{name} · {folder}",
                     f"{LABELS.get(folder, '')} · {len(items)} 张 · Codex 逐张确认是否属于本企业与本分类",
@@ -564,7 +605,7 @@ def main():
                  f'--en "{en_file}" --summary "{summary_file}" '
                  f'--visual "{json_path}" --require-visual')
     guide = review / "核对指引.md"
-    write_review_guide(guide, records_map, review, json_path, gates_cmd)
+    write_review_guide(guide, records_map, review, json_path, gates_cmd, pages_map)
 
     print(f"企业 {len(archives)} 家")
     for name in archives:

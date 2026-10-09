@@ -6,6 +6,8 @@
 
 ```powershell
 $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
+# 视觉核对开工前：先查会话体积（>20MB 先另开会话）
+python "$SkillRoot\scripts\session_guard.py"
 python "$SkillRoot\scripts\gates.py" `
   --deliverable "<输出>\build\<run_id>\deliverable" `
   --raw "<输出>\build\<run_id>\raw" `
@@ -101,10 +103,10 @@ python "$SkillRoot\scripts\gates.py" `
 
 核对方式（Codex 直接把拼版当图片打开，逐张看，不得推给用户）：
 
-必须在短线程内完成：每批 ≤10 家，一个会话只做「看图 → 回写结论 → 跑门禁 → 发布」，做完即止。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以脚本把单页限制为 ≤12 张、≤1MB，图片多时按 `<分类>_p1.png`、`<分类>_p2.png` 分页，同一分类的所有页都要看。
+必须在短线程内完成：每批 ≤10 家，一个会话只做「查体积 → 看图 → 回写结论 → 跑门禁 → 发布」，做完即止；开工前跑 `scripts/session_guard.py`，本会话 rollout >20MB 先换会话。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以脚本把单页限制为 ≤12 张、≤1MB，图片多时按序号分页为 `<分类>_p1.png`、`<分类>_p2.png`……初筛点名的页必须逐页看，整类无疑点时可给类别结论。
 
-1. 打开 `review/核对指引.md`，按其中绝对路径打开 `<企业>/0.总览.png` 做初筛；
-2. 疑点打开 `<分类>.png`（分页时为 `<分类>_p1.png`、`_p2.png`…，全看完）放大确认；同时核对简介 docx 与产品清单内容；
+1. 打开 `review/核对指引.md`，图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt）；
+2. 按指引标注的序号范围打开对应 `<分类>_pN.png` 放大确认，被点名的页都要看；图片少时打开 `0.总览.png` 初筛、疑点再看分类拼版。同时核对简介 docx 与产品清单内容；
 3. 把结论写进 `review/verdicts.json`：可只写类别结论（该类未单独填写的图继承），也可写单张；然后执行 `visual_review.py --json "<run_id>/视觉核对.json" --apply "<run_id>/review/verdicts.json" --reviewer Codex` 回写；
 4. 执行 `gates.py --require-visual` 复核；全绿后用 `local_pipeline.py --publish-stage "<run_id>" --out "<输出目录>"` 发布。
 
