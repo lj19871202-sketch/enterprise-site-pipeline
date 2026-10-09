@@ -1552,17 +1552,9 @@ def ingest_resources(company, resource_dir, raw_home, backup_home, args):
                 doc_texts.append({"rel": str(rel), "cat": cat, "text": text})
             elif ext == ".pdf":
                 notes["抽取失败"].append(f"PDF 未抽到文本（已备份）：{rel}")
-            # 归类明确的文档（证书/资质/工厂/产品/logo）原件也落进对应交付文件夹；
-            # 简介类(about)只提供文本，不进图片文件夹。
-            if cat in updates and ext not in RESOURCE_TABLE_EXTS:
-                folder = raw_home / IMAGE_DIRS[cat]
-                folder.mkdir(parents=True, exist_ok=True)
-                filename = f"user_{safe_filename(fp.stem)}{ext}"
-                try:
-                    shutil.copy2(fp, folder / filename)
-                except Exception as exc:
-                    notes["抽取失败"].append(f"文档拷贝失败 {rel}: {exc}")
-            elif ext in RESOURCE_TABLE_EXTS:
+            # 文档/PDF/PPT 等只抽取文本或事实，原件归入交付之外的备份目录；
+            # 交付五文件夹内只放图片素材，避免非图片文件成为未登记孤儿。
+            if ext in RESOURCE_TABLE_EXTS:
                 notes["表格"].append({"文件": str(rel), "归类": cat or "待定", "字符数": len(text)})
         else:
             notes["未归类"].append(f"未知格式：{rel}")

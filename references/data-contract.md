@@ -80,7 +80,7 @@
 }
 ```
 
-`资料来源` / `资料备注` 仅在通过 `--resources` 提供资料时出现。用户资料图的记录形如 `{"file": "user_xxx.jpg", "alt": "...", "url": "", "from": "照片/xxx.jpg", "wh": "", "source": "用户资料"}`——`url` 为空、`from` 记录相对原始路径、`source` 为 `用户资料`，与官网图区分；`gate_image_provenance` 对用户资料图跳过官网同域校验。
+`资料来源` / `资料备注` 仅在通过 `--resources` 提供资料时出现。用户资料图的记录形如 `{"file": "user_xxx.jpg", "alt": "...", "url": "", "from": "照片/xxx.jpg", "wh": "", "source": "用户资料"}`——`url` 为空、`from` 记录相对原始路径、`source` 为 `用户资料`，与官网图区分；`gate_image_provenance` 对用户资料图跳过官网同域校验。交付五文件夹内只含图片，Word/Excel/PDF/PPT 等非图片原件不进交付，仅在备份目录留存。
 
 字段原则：
 

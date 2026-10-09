@@ -548,8 +548,9 @@ def gate_docx_sync(ctx):
             continue
         want = ((ctx["en"] or {}).get(name) or {}).get("英文简介") or []
         ps = docx_paragraphs(hits[0])
-        if len(ps) < 4:
-            bad.append(f"{name}: 段落不足")
+        zh = [t for t in ps[1:] if CJK.search(t)]
+        if not zh:
+            bad.append(f"{name}: 缺少中文简介段")
             continue
         got = split_docx(ps)[2]
         if [t.strip() for t in want] != got:
