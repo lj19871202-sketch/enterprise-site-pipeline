@@ -25,7 +25,7 @@
 
 企业已有资料时，用 `-Resources`（CLI：`--resources`）指向资料总目录：总目录下每家企业一个**任意命名**子文件夹，单家企业时也可直接传该企业文件夹。资料**不要求按规范结构**提交，格式除图片/Word/Excel 外还可能是 PDF、PPT、txt 等。冲突时**用户资料优先，官网只作补充**；原件会备份到 `<输出目录>\原始资料备份`（在 `deliverable` 之外，保留原目录结构）。
 
-新环境先引导：创建技能独立 `.venv`，按 `requirements.lock.txt` 安装锁定依赖并自检。`run_local.ps1` 缺核心依赖时也会自动调用：
+新环境先引导：创建技能独立 `.venv`，按 `requirements.lock.txt` 安装锁定依赖并自检（需联网；已在干净克隆上实测通过）。`run_local.ps1` 缺核心依赖时也会自动调用：
 
 ```powershell
 $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
@@ -165,5 +165,9 @@ python "$SkillRoot\scripts\gates.py" --deliverable "<...>\deliverable" --raw "<.
 - 自动官网发现依赖搜索引擎可达性；置信度低时 Codex 必须打开候选站点复核，完全找不到才标 `no_website`。
 - 英文默认走 MyMemory 免费接口自动中译英。该接口有每日匿名额度，批量较大时部分条目可能翻译失败：失败条目在 `en.json` 标 `翻译失败: true`，并写入 `英文补译清单.json`；自检中的 429 是可恢复 `WARN`，不是环境致命错误。默认门禁阻断发布，Codex 必须基于中文事实生成 `--en` 补译草稿并保留 `定稿: false`、`自动翻译: true`、`备注: 待人工核校`。只有用户明确接受中文版时才可使用 `--accept-no-english`。
 - 输入格式当前以 `.xlsx` / `.xlsm` 为主；老式 `.xls` 请先另存为 `.xlsx`。
+- **新环境可复现性（已实测）。** 在全新克隆、无 `.venv` 的目录上跑 `bootstrap.ps1`（从 PyPI 装锁定依赖）后再用 `run_local.ps1`，含官网场景与"仅资料、无官网"（`resource_only`）场景均门禁全绿、退出码 0；交付严格为"五文件夹 + 产品清单.xlsx"、五个文件夹内零子目录，PDF/PPT/DOCX/XLSX 原件只落在 `deliverable` 之外的 `原始资料备份/`。该结论是干净克隆模拟，不等同于全新物理机。
+- **必须联网。** `bootstrap.ps1` 从 PyPI 安装依赖、官网抓取、MyMemory 翻译都依赖网络；断网环境需预先离线装好依赖与渲染内核，并自行准备离线 HTML 快照（`-HtmlDir`）。
+- **PDF 抽取是尽力而为。** 环境有 `pypdf`/`PyPDF2` 时抽前 20 页；没有时 PDF 只归档并在 `资料备注` 记"PDF 未抽到文本"，不阻断主流程。PPTX 用 zipfile+XML 抽文本，不依赖 `python-pptx`。
+- **必须由 Codex 复核的项**（脚本只给告警，不算失败）：官网自动发现置信度为低/中时须打开站点确认；`visual_review` 必须看图回写结论后才能发布；图片直链走 CDN 的外域需人工确认。
 
 详细说明见 `SKILL.md` 和 `references/`。

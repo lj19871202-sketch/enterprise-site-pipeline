@@ -7,7 +7,7 @@ scripts/local_pipeline.py
 scripts/run_local.ps1
 ```
 
-脚本在 Codex 当前本机执行，输入 Excel，输出企业官网资料包。不要把这套流程拆成远端会话或手工多机复制。新环境先运行 `bootstrap.ps1` 创建技能独立 `.venv`，并按 `requirements.lock.txt` 安装锁定依赖。
+脚本在 Codex 当前本机执行，输入 Excel，输出企业官网资料包。不要把这套流程拆成远端会话或手工多机复制。新环境先运行 `bootstrap.ps1` 创建技能独立 `.venv`，并按 `requirements.lock.txt` 安装锁定依赖（需联网；已在无 `.venv` 的干净克隆上实测通过）。
 
 ## 阶段 0 · 读取 Excel
 

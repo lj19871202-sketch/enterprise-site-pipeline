@@ -189,7 +189,7 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 - **用户资料优先，且必须备份。** 冲突时以用户提交的资料为准，官网只作补充；所有原件必须在 `deliverable` 之外的备份目录保留原目录结构，不得覆盖、丢弃或改动原件。
 - **不要求用户改资料结构。** 用户资料可能是任意目录层级、任意命名、任意格式（图片/Word/Excel/PDF/PPT/txt…）。不得因为"结构不规范""格式不在清单里"就拒收或跳过；无法归类或抽取失败的项要记入 `资料备注` 并保留原件。
 - **无官网列要自动发现，低置信度必须复核。** 输入表缺官网列时，先由脚本自动搜索、抓取和打分；高/中置信度自动采用，低置信度必须由 Codex 打开站点确认后再交付，不得直接跳过该企业。
-- **依赖必须齐全且锁定。** 新环境先运行 `bootstrap.ps1`；它创建技能独立 `.venv`，按 `requirements.lock.txt` 安装 `openpyxl`、`python-docx`、`Pillow`、`playwright` 的已验证版本。`requirements.txt` 只提供带主版本上限的可更新范围。`run_local.ps1` 缺核心依赖时会自动引导。Pillow 缺失会让视觉核对材料静默消失，不能被当作“没有疑点”。
+- **依赖必须齐全且锁定。** 新环境先运行 `bootstrap.ps1`；它创建技能独立 `.venv`，按 `requirements.lock.txt` 安装 `openpyxl`、`python-docx`、`Pillow`、`playwright` 的已验证版本。`requirements.txt` 只提供带主版本上限的可更新范围。`run_local.ps1` 缺核心依赖时会自动引导。Pillow 缺失会让视觉核对材料静默消失，不能被当作“没有疑点”。该引导需联网（从 PyPI 安装）；已在无 `.venv` 的干净克隆上实测——含官网与"仅资料成档"两类场景均门禁全绿，交付严格为"五文件夹 + 产品清单.xlsx"、文件夹内零子目录，非图片原件只存 `deliverable` 之外的备份。
 - **Playwright 复用优先。** `run_local.ps1` 先复用当前 Python/技能 `.venv` 中已有的 Playwright；渲染内核按内置 Chromium → 本机 Edge 自动选择，两者都不可用才考虑安装 Chromium。可用 Codex 内置浏览器保存 HTML 并经 `-HtmlDir` 兜底。
 - **机翻不等于定稿。** 自动英文来自机翻，必须在 `en.json`/汇总/交付说明中保留 `自动翻译: true`、`待人工核校` 标记，不得当作人工定稿交付。
 - **不把空结果当成功。** 四类图全空、官网未确认、简介不足三段都要显式记录并单独列出。
