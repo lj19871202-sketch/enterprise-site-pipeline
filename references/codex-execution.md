@@ -10,8 +10,10 @@
 |---|---|---|
 | 执行机 | 当前 Codex Windows 主机 | 运行 Python、请求网页、下载图片、生成文件 |
 | 输入 | 用户提供的本地 Excel | 至少包含企业名称列；可选官网列 |
+| 用户资料 | 用户提供的本地资料目录（`--resources`） | 每家企业一个**任意命名**子文件夹，或单家企业文件夹；结构与格式不限 |
 | 临时构建 | `<输出目录>\build\<run_id>\` | 本次抓取、raw、render 和门禁的暂存区 |
-| 发布目录 | `<输出目录>\deliverable\` | 门禁通过后的交付副本 |
+| 发布目录 | `<输出目录>\deliverable\` | 门禁通过后的交付副本（每家企业固定五文件夹 + 产品清单 xlsx） |
+| 原件备份 | `<输出目录>\原始资料备份\` | 用户提交的原始资料原件，保留原目录结构；在 `deliverable` 之外，可用 `--backup-dir` 改位置 |
 
 先解析 skill 根目录，后续命令都以它为准（装到任意路径只需改这一行）：
 
@@ -55,6 +57,17 @@ $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
   -Limit 3
 ```
 
+有用户资料时加 `-Resources`（结构与格式不限，脚本负责匹配与分类）：
+
+```powershell
+& "$SkillRoot\scripts\run_local.ps1" `
+  -Excel "D:\path\企业名录.xlsx" `
+  -Out "D:\path\企业官网资料包" `
+  -Resources "D:\path\企业原始资料" `
+  -BackupDir "D:\path\企业原始资料备份" `
+  -Limit 3
+```
+
 `run_local.ps1` 会自动寻找同时包含 `openpyxl`、`python-docx`、`Pillow` 的 Python 解释器，然后调用：
 
 ```text
@@ -82,9 +95,10 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
    引导会创建技能独立 `.venv`、按 `requirements.lock.txt` 安装依赖并运行自检。自检覆盖 Python 依赖（openpyxl / python-docx / Pillow / playwright）、渲染内核（内置 Chromium 或本机 Edge）、本机出网、MyMemory 中译英、Excel 可读性、前 3 家官网可达性或自动发现结果。任何 `[FAIL]` 都先修再跑全量。MyMemory 429/限流是 `[WARN]` 可恢复告警，不阻止对新环境的基本判定；正式生成如仍失败，会写 `英文补译清单.json`，由 Codex 补 `--en`。
 1. Excel 第一个工作表包含表头；企业名称列名可用 `企业名称`、`公司名称`、`单位名称` 或 `名称`。
-2. 官网列可选，列名可用 `官网`、`网址`、`网站`、`官网地址`。没有官网列时，脚本会用企业全称和去地域核心名做多引擎搜索，并按域名与公司名共现、站点内容命中综合打分自动发现官网；低/中置信度结果由 Codex 打开候选站点复核后再进入正式交付，不能把低置信度结果直接当事实。
-3. JS 渲染站默认走 `--playwright auto`：普通站先静态抓取，页面内容过薄且本机 Playwright 可用时自动渲染重抓；需要强制渲染用 `on`，离线排障用 `off`。
-4. 输出目录不要指向 Excel 所在文件本身或已有重要交付目录。脚本会在输出目录下创建 `build/<run_id>/`。
+2. 用户资料可选，通过 `-Resources` 指向总目录；每家企业一个任意命名子文件夹（脚本先剥离"资料/文件/材料"等词、再用企业全称/核心名/品牌词匹配），单家企业时总目录本身可就是企业文件夹。资料不要求按规范结构提交，格式除图片/Word/Excel 外还可能是 PDF/PPT/txt；原件在 `deliverable` 之外备份。冲突时用户资料优先，官网只作补充。
+3. 官网列可选，列名可用 `官网`、`网址`、`网站`、`官网地址`。没有官网列时，脚本会用企业全称和去地域核心名做多引擎搜索，并按域名与公司名共现、站点内容命中综合打分自动发现官网；低/中置信度结果由 Codex 打开候选站点复核后再进入正式交付，不能把低置信度结果直接当事实。
+4. JS 渲染站默认走 `--playwright auto`：普通站先静态抓取，页面内容过薄且本机 Playwright 可用时自动渲染重抓；需要强制渲染用 `on`，离线排障用 `off`。
+5. 输出目录不要指向 Excel 所在文件本身或已有重要交付目录。脚本会在输出目录下创建 `build/<run_id>/`。
 
 ## 四、常用参数
 
@@ -99,6 +113,8 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | `--playwright {auto,on,off}` | `auto` 默认：静态优先，内容过薄时渲染重抓；`on` 强制渲染；`off` 纯静态 |
 | `--browser-probe` | 只探测可用渲染内核后退出，输出 `chromium`/`msedge`/`msedge-exe`/`none` |
 | `-HtmlDir <目录>` / `--html-dir <目录>` | 用 Codex 内置浏览器保存的离线 HTML 兜底抓取（目录内需 `manifest.json`，形如 `{"https://a.com/":"a.html"}`） |
+| `-Resources <目录>` / `--resources <目录>` | 用户资料总目录：每家企业一个任意命名子文件夹，或单家企业文件夹；结构与格式不限（图片/Word/Excel/PDF/PPT/txt…） |
+| `-BackupDir <目录>` / `--backup-dir <目录>` | 原始资料备份目录，默认 `<输出目录>\原始资料备份`，位于 `deliverable` 之外，保留原目录结构 |
 | `--require-visual` | 视觉核对未完成时按 error 处理，发布前应开启 |
 | `--publish-stage <build/run_id>` | 不重抓，直接把已完成的 stage 发布到 `--out` |
 | `--no-publish` | 门禁通过也不发布，仅保留 build 目录，供 Codex 看图核对后再发布 |

@@ -5,6 +5,8 @@
     [string]$Out = "",
     [string]$En = "",
     [string]$HtmlDir = "",          # Codex 内置浏览器保存的离线 HTML 目录（含 manifest.json）
+    [string]$Resources = "",        # 用户资料总目录：每家一个任意命名子文件夹，或单家企业文件夹
+    [string]$BackupDir = "",        # 原始资料备份目录（默认 <输出目录>\原始资料备份，在 deliverable 之外）
     [switch]$AcceptNoEnglish,       # 用户明确接受中文版；英文相关门禁降为告警
     [int]$Limit = 0,
     [string]$TranslateEmail = "",
@@ -206,6 +208,11 @@ if ($HtmlDir) {
     if (-not (Test-Path -LiteralPath $HtmlDir)) { throw "找不到离线 HTML 目录：$HtmlDir" }
     $runArgs += @("--html-dir", (Resolve-Path -LiteralPath $HtmlDir).Path)
 }
+if ($Resources) {
+    if (-not (Test-Path -LiteralPath $Resources)) { throw "找不到资料目录：$Resources" }
+    $runArgs += @("--resources", (Resolve-Path -LiteralPath $Resources).Path)
+}
+if ($BackupDir) { $runArgs += @("--backup-dir", [IO.Path]::GetFullPath($BackupDir)) }
 if ($Limit -gt 0) { $runArgs += @("--limit", [string]$Limit) }
 if ($TranslateEmail) { $runArgs += @("--translate-email", $TranslateEmail) }
 if ($NoTranslate) { $runArgs += "--no-translate" }

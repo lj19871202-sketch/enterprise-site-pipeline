@@ -37,12 +37,12 @@ python "$SkillRoot\scripts\gates.py" `
 
 | id | 级别 | 判据 | 阈值 |
 |---|---|---|---|
-| `site_discovery` | error/warn | 官网必须发现；自动发现置信度为中/低时由 Codex 打开候选站点复核 | 未发现 0 家；中/低置信度仅告警 |
+| `site_discovery` | error/warn | 官网必须发现；自动发现置信度为中/低时由 Codex 打开候选站点复核；`resource_only`（官网不可用但用户资料可用）单列告警 | 未发现 0 家（`resource_only` 除外）；中/低置信度仅告警 |
 | `coverage` | error | 档案、目录、英文、汇总四方企业集合一致，且数量等于 `expected_companies` | 差集为空 |
 | `structure` | error | 每家固定为五文件夹 + 产品清单 xlsx；企业根目录无多余项，五文件夹内只允许直接文件、不得嵌套子目录 | 缺失数 0、多余项 0、嵌套目录 0 |
 | `images` | error | 档案里的图片引用都落到真实文件；交付目录里没有 raw 未记录的孤儿图；跨类重复图；四类图是否全空 | 失效引用 0、孤儿图 0、跨类重复组 0、四类全空 0 家 |
 | `image_required` | warn | 单独检查 `logo` 与 `factory` 两类是否有图；官网确实没有素材时保留告警并写数据边界，不硬性阻断 | 空类 0 条（否则告警） |
-| `image_provenance` | error | 每张图的来源页必须与官网同域；图片直链外域单独列出 | 来源页非官网 0 条（直链外域仅提示） |
+| `image_provenance` | error | 每张官网图的来源页必须与官网同域；`source: 用户资料` 的图跳过同域校验并计入 `user_src` 提示；图片直链外域单独列出 | 来源页非官网 0 条（用户资料图、直链外域仅提示） |
 | `en_entry` | error/warn | 英文条目六字段齐全且非空；简介恰 3 段；每段 ≥60 字符；英文名/标题/品牌/简介/产品英名无中日韩字符（`子品类` 是中文分类，豁免）；只有显式 `--accept-no-english` 才降为 warn | 问题条目 0 |
 | `en_ascii` | error/warn | 英文段非 ASCII 字符占比；只有显式 `--accept-no-english` 才降为 warn | ≤ 0.02 |
 | `en_pinyin` | warn | 英文段疑似拼音/栏目词 token 占比 | ≥ 0.60 告警 |
@@ -53,13 +53,16 @@ python "$SkillRoot\scripts\gates.py" `
 | `product_map` | error/warn | 档案产品在 `产品英名` 中的覆盖率；只有显式 `--accept-no-english` 才降为 warn | ≥ 0.80 |
 | `docx_sync` | error | docx 英文段与 `en.json` 英文简介逐字一致 | 不一致家数 0 |
 | `docx_source` | error | docx 中文段与 raw `intro_paragraphs` 逐段一致 | 不一致家数 0 |
+| `resource_intake` | warn | 用户资料摄入情况：`资料备注` 含"未归类/抽取失败"则告警（原件已备份，需人工确认）；`resource_only` 单列 | 告警，不阻断 |
 | `noise` | error | 中文或英文正文段不含导航/备案/联系方式/黄页词等噪声模式 | 命中 0 |
 | `summary` | error | 汇总表表头与行列数符合约定 | 表头精确匹配 |
 | `visual_review` | warn/error | 读取 `视觉核对.json`：结论为“不符”即 error；未回写结论按 warn，加 `--require-visual` 后按 error | 不符 0 条；`--require-visual` 时未核对 0 条 |
 
 ## 关键门禁的意义
 
-**`site_discovery`** —— 官网是整条流水线的事实源。未发现官网直接 error；自动发现置信度为中/低时先 warn，Codex 必须打开候选站点核对，确认后再运行或补 Excel 官网列；不允许把低置信度结果静默当事实。
+**`site_discovery`** —— 官网是整条流水线的事实源。未发现官网直接 error；自动发现置信度为中/低时先 warn，Codex 必须打开候选站点核对，确认后再运行或补 Excel 官网列；不允许把低置信度结果静默当事实。若官网未确认或不可访问但用户资料可用，记 `resource_only`（仅凭用户资料成档），`site_discovery` 降为告警并单列，不算失败。
+
+**`resource_intake`** —— 用户资料可能以任意目录结构、任意格式提交（图片/Word/Excel/PDF/PPT/txt…）。脚本递归扫描、按企业名匹配、按类别归档并抽取文本，原件备份在 `deliverable` 之外。无法归类或抽取失败的项会在 `资料备注` 记录并触发本门禁告警（不阻断交付），Codex 需人工确认这些项是否可忽略或需手工补录；原件始终保留在备份目录。
 
 **`en_entry` / `en_ascii` / `product_en` / `product_detail` / `product_map`** —— 默认英文来自自动中译英草稿，`en.json` 带 `自动翻译: true`、`定稿: false`、`翻译失败` 标记。英文缺口会先写入 `<run_id>/英文补译清单.json`，门禁默认按 error 阻断发布，正常修复路径是补 `--en`。MyMemory 429/限流在 `--selftest` 中是可恢复 `WARN`，不等于允许带英文缺口交付。只有用户在当次对话中明确接受中文版时，`--accept-no-english` 才把英文缺失降为 warn；检查仍执行，缺口仍保留在结果中。
 

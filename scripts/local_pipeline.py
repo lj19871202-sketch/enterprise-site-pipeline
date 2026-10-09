@@ -167,6 +167,17 @@ def clean_inline(s):
     return re.sub(r"\s+", " ", _html.unescape(str(s or ""))).strip()
 
 
+def clean_lines(s):
+    """保留换行/制表符的清洗：用于表格类资料，避免行列边界丢失。"""
+    s = _html.unescape(str(s or "")).replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for line in s.split("\n"):
+        line = re.sub(r"[ \u00a0\u3000]+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def safe_filename(s, fallback="company"):
     s = clean_inline(s)
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
@@ -1302,6 +1313,395 @@ def download_images(name, pages, home, args):
     return buckets
 
 
+# ---- 用户资料摄入 --------------------------------------------------------
+# 企业可能以任意文件夹结构、任意格式（图片/Word/Excel/PDF/PPT）提交资料。
+# 本模块递归扫描资料根目录，按“扩展名 + 文件名/路径关键词”把素材归类，
+# 图片直接归入四类，文档类抽取文本作为企业事实；原始文件另存备份。
+
+RESOURCE_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".tif", ".tiff")
+RESOURCE_TEXT_EXTS = (".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".pdf", ".ppt", ".pptx", ".txt", ".md", ".csv")
+# 表格类只抽文本、不当作图片素材拷进图片文件夹（产品清单 xlsx 不应进入 2.企业产品图）。
+RESOURCE_TABLE_EXTS = (".xls", ".xlsx", ".xlsm", ".csv")
+
+# 关键词 -> 归类。优先匹配更具体的类别；大小写不敏感。
+RESOURCE_CAT_KEYWORDS = [
+    ("logo", ("logo", "标志", "徽标", "商标", "标识", "brand")),
+    ("cert", ("证书", "资质", "荣誉", "认证", "certificate", "cert", "honor", "award",
+              "iso", "专利", "许可", "检测报告", "营业执照")),
+    ("factory", ("工厂", "车间", "厂房", "厂区", "生产", "设备", "基地", "生产线",
+                 "factory", "workshop", "plant", "equipment")),
+    ("product", ("产品", "商品", "产品图", "样品", "型号", "product", "goods", "pro_")),
+    ("about", ("简介", "介绍", "关于", "公司", "profile", "about", "company", "宣传")),
+]
+
+
+def resource_category(name):
+    """按文件名/相对路径关键词返回归类：logo/cert/factory/product/about/''。"""
+    s = clean_inline(name).lower()
+    for cat, words in RESOURCE_CAT_KEYWORDS:
+        if any(w in s for w in words):
+            return cat
+    return ""
+
+
+def _docx_text(path):
+    try:
+        from docx import Document
+        doc = Document(str(path))
+        parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" ".join(cells))
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _xlsx_text(path):
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(str(path), read_only=True, data_only=True)
+        parts = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                cells = [clean_inline(c) for c in row if c not in (None, "")]
+                if cells:
+                    # 用制表符保留列边界，供产品清单按“产品名/型号/说明”分列解析。
+                    parts.append("\t".join(cells))
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _pptx_text(path):
+    """PPTX 文本走 zipfile + XML，避免额外依赖。"""
+    try:
+        import zipfile
+        from xml.etree import ElementTree as ET
+        ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+        parts = []
+        with zipfile.ZipFile(str(path)) as z:
+            slides = sorted(n for n in z.namelist()
+                            if re.match(r"ppt/slides/slide\d+\.xml$", n))
+            for name in slides:
+                try:
+                    root = ET.fromstring(z.read(name))
+                except Exception:
+                    continue
+                texts = [t.text for t in root.iter(ns + "t") if t.text and t.text.strip()]
+                if texts:
+                    parts.append(" ".join(texts))
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _pdf_text(path):
+    """PDF 抽取尽力而为：环境有 pypdf/PyPDF2 才抽，否则只归档。"""
+    for mod in ("pypdf", "PyPDF2"):
+        try:
+            m = __import__(mod)
+            reader = m.PdfReader(str(path))
+            parts = []
+            for page in reader.pages[:20]:
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                if t.strip():
+                    parts.append(t)
+            return "\n".join(parts)
+        except Exception:
+            continue
+    return ""
+
+
+def resource_text(path):
+    """按扩展名抽取文档文本；不支持或失败返回空串。"""
+    ext = Path(path).suffix.lower()
+    if ext == ".docx":
+        return _docx_text(path)
+    if ext in (".xlsx", ".xlsm"):
+        return _xlsx_text(path)
+    if ext == ".pptx":
+        return _pptx_text(path)
+    if ext == ".pdf":
+        return _pdf_text(path)
+    if ext in (".txt", ".md", ".csv"):
+        for enc in ("utf-8", "gbk", "utf-16"):
+            try:
+                return Path(path).read_text(encoding=enc)
+            except Exception:
+                continue
+    return ""
+
+
+def resource_match_tokens(name):
+    """企业名的匹配 token：全称、去地域/去后缀核心名、以及核心名去掉通用词后的品牌词。"""
+    full = normalize_key(name)
+    core = normalize_key(core_company_name(name))
+    toks = set()
+    for t in (full, core):
+        if len(t) >= 3:
+            toks.add(t)
+    generic = ("新能源科技", "科技", "机械制造", "制造", "实业", "贸易", "电子商务",
+               "电子", "材料", "装备", "工程", "食品", "农业", "生物", "医药", "环保",
+               "设备", "建设", "发展", "管理", "服务", "文化", "旅游", "物流")
+    for t in (core, full):
+        for g in generic:
+            if t.endswith(g) and len(t) - len(g) >= 2:
+                toks.add(t[:-len(g)])
+            if g in t and len(t) - len(g) >= 2:
+                toks.add(t.replace(g, ""))
+    # 前缀品牌词：资料目录常只写企业名开头（如“川澜”“天翔”），补 core 的前缀子串。
+    # 只取 2-4 字前缀，且不落入通用词，降低误匹配。
+    for n in (2, 3, 4):
+        if len(core) > n:
+            toks.add(core[:n])
+    toks -= set(generic)
+    return {t for t in toks if len(t) >= 2}
+
+
+def match_resource_dir(companies, root):
+    """把资料根目录下的子文件夹匹配到企业名。
+
+    规则：子文件夹名与企业全称/核心名/品牌词互相包含即算命中；子文件夹名含
+    “资料/文件/材料”等无意义词时先剥离。多家企业命中同一目录时按最长 token 归属。
+    返回 {企业名: 企业资料目录}，未命中的企业不出现在结果里。
+    """
+    result = {}
+    if not root or not Path(root).is_dir():
+        return result
+    root = Path(root)
+    subdirs = [d for d in sorted(root.iterdir()) if d.is_dir()]
+    stop = ("资料", "文件", "素材", "图片", "照片", "文档", "企业", "公司")
+    keys = {c: resource_match_tokens(c) for c in companies}
+    for d in subdirs:
+        dkey = normalize_key(d.name)
+        if not dkey:
+            continue
+        for w in stop:
+            dkey = dkey.replace(w, "")
+        if not dkey:
+            continue
+        best, best_len = "", 0
+        for c, toks in keys.items():
+            for t in toks:
+                if t and (t in dkey or dkey in t) and len(t) > best_len:
+                    best, best_len = c, len(t)
+        if best:
+            result[best] = d
+    return result
+
+
+def ingest_resources(company, resource_dir, raw_home, backup_home, args):
+    """扫描一家企业的资料目录，返回 (updates, notes)。
+
+    - 图片：按类别直接拷入 raw_home/<类别目录>，文件名以 user_ 前缀区分来源；
+      render 阶段会把它连同官网图一起搬进交付目录的五文件夹。
+    - 文档：抽文本，归入简介/产品/资质事实；原始文件复制到 backup_home 备份。
+      表格类（xls/xlsx/xlsm/csv）只抽文本，不拷进图片文件夹。
+    - 未知格式：原件照样备份并记入未归类清单，不静默丢弃。
+    """
+    updates = {"logo": [], "product": [], "cert": [], "factory": []}
+    notes = {"企业": company, "文档": [], "表格": [], "未归类": [], "抽取失败": []}
+    if not resource_dir or not Path(resource_dir).is_dir():
+        return updates, notes
+    resource_dir = Path(resource_dir)
+    raw_home = Path(raw_home)
+    if str(backup_home):
+        backup_home = Path(backup_home)
+        backup_home.mkdir(parents=True, exist_ok=True)
+    doc_texts = []
+    for fp in sorted(resource_dir.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = fp.relative_to(resource_dir)
+        rel_key = str(rel)  # 用相对路径参与关键词判断（目录名也可能含类别词）
+        ext = fp.suffix.lower()
+        # 原始文件一律备份（在交付父文件夹之外保留用户交来的全部资料）
+        try:
+            dest = backup_home / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fp, dest)
+        except Exception as exc:
+            notes["抽取失败"].append(f"备份失败 {rel}: {exc}")
+        if ext in RESOURCE_IMAGE_EXTS:
+            cat = resource_category(rel_key)
+            if cat in updates:
+                folder = raw_home / IMAGE_DIRS[cat]
+                folder.mkdir(parents=True, exist_ok=True)
+                filename = f"user_{safe_filename(fp.stem)}{ext}"
+                try:
+                    shutil.copy2(fp, folder / filename)
+                except Exception as exc:
+                    notes["抽取失败"].append(f"图片拷贝失败 {rel}: {exc}")
+                    continue
+                updates[cat].append({
+                    "file": filename, "alt": clean_inline(fp.stem),
+                    "url": "", "from": str(rel), "wh": "", "source": "用户资料",
+                })
+            else:
+                notes["未归类"].append(f"图片未归类：{rel}")
+        elif ext in RESOURCE_TEXT_EXTS:
+            cat = resource_category(rel_key)
+            text = resource_text(fp)
+            if text.strip():
+                doc_texts.append({"rel": str(rel), "cat": cat, "text": text})
+            elif ext == ".pdf":
+                notes["抽取失败"].append(f"PDF 未抽到文本（已备份）：{rel}")
+            # 归类明确的文档（证书/资质/工厂/产品/logo）原件也落进对应交付文件夹；
+            # 简介类(about)只提供文本，不进图片文件夹。
+            if cat in updates and ext not in RESOURCE_TABLE_EXTS:
+                folder = raw_home / IMAGE_DIRS[cat]
+                folder.mkdir(parents=True, exist_ok=True)
+                filename = f"user_{safe_filename(fp.stem)}{ext}"
+                try:
+                    shutil.copy2(fp, folder / filename)
+                except Exception as exc:
+                    notes["抽取失败"].append(f"文档拷贝失败 {rel}: {exc}")
+            elif ext in RESOURCE_TABLE_EXTS:
+                notes["表格"].append({"文件": str(rel), "归类": cat or "待定", "字符数": len(text)})
+        else:
+            notes["未归类"].append(f"未知格式：{rel}")
+    for d in doc_texts:
+        notes["文档"].append({"文件": d["rel"], "归类": d["cat"] or "待定", "字符数": len(d["text"])})
+    updates["_doc_texts"] = doc_texts
+    return updates, notes
+
+
+def resource_notes_summary(notes):
+    """把摄入备注压成一句人类可读的摘要，写入 raw 与汇总表。"""
+    if not notes:
+        return ""
+    docs = len(notes.get("文档") or [])
+    tables = len(notes.get("表格") or [])
+    unclassified = len(notes.get("未归类") or [])
+    failed = len(notes.get("抽取失败") or [])
+    parts = []
+    if docs:
+        parts.append(f"抽取文档 {docs} 份")
+    if tables:
+        parts.append(f"抽到表格 {tables} 份")
+    if unclassified:
+        parts.append(f"未归类 {unclassified} 项")
+    if failed:
+        parts.append(f"抽取/备份失败 {failed} 项")
+    return "用户资料：" + ("、".join(parts) if parts else "已摄入")
+
+
+def _docs_to_facts(doc_texts):
+    """从用户文档文本中提取简介段落、产品名与产品详情。"""
+    intro, products, details = [], [], {}
+    seen_intro, seen_product = set(), set()
+    for d in doc_texts:
+        raw = d.get("text", "")
+        table_like = "\t" in raw or d.get("table") is True
+        text = clean_lines(raw) if table_like else clean_inline(raw)
+        cat = d.get("cat", "")
+        # 简介：优先 about/简介类文档，或含明显公司介绍句的文本
+        for s in sentence_list(text):
+            if len(intro) >= 3:
+                break
+            if any(w in s for w in ("公司", "企业", "成立", "位于", "主营", "是一家", "简介", "工厂")):
+                k = normalize_key(s)
+                if k and k not in seen_intro:
+                    seen_intro.add(k)
+                    intro.append(s)
+        # 产品：只从产品类文档或含明确产品清单的结构行里提；一行一个产品，
+        # 取该行第一个短字段作为产品名，整行作为产品详情，避免把简介句/导航词当产品。
+        looks_like_table = ("产品" in text[:80] or "型号" in text[:80] or "系列" in text[:80])
+        if cat == "product" or looks_like_table:
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                has_col = "\t" in line
+                # 整行纯叙述句（含句号且很长、且不是分列表格行）不是产品行，跳过。
+                if not has_col and len(line) > 40 and ("。" in line or "，" in line):
+                    continue
+                cells = [x.strip() for x in (line.split("\t") if has_col
+                                             else re.split(r"[，、;；|]+|\s{2,}", line))]
+                cells = [x for x in cells if x]
+                if not cells:
+                    continue
+                name = cells[0]
+                # 表头行/说明行过滤
+                if name in ("产品名称", "名称", "产品", "型号", "产品名"):
+                    continue
+                if not (2 <= len(name) <= 20):
+                    continue
+                if any(w in name for w in ("公司", "企业", "成立于", "位于", "在线", "主营")):
+                    continue
+                k = normalize_key(name)
+                if not k or k in seen_product:
+                    continue
+                seen_product.add(k)
+                products.append(name)
+                details.setdefault(name, line[:200])
+    return intro, products, details
+
+
+def finalize_resource_only(archive, res_updates, args):
+    """官网不可用、仅凭用户资料成档时，填充事实与图片。"""
+    doc_texts = res_updates.get("_doc_texts") or []
+    intro, products, details = _docs_to_facts(doc_texts)
+    for k in IMAGE_DIRS:
+        archive[k] = list(res_updates.get(k) or [])
+    if products:
+        archive["products"] = products[:args.max_products] if args.max_products else products
+    if details:
+        archive["product_details"] = details
+    if not intro:
+        # 无 about 文档时，用最长的一段资料文本兜底，避免简介全空。
+        blob = max((clean_inline(d.get("text", "")) for d in doc_texts), key=len, default="")
+        for s in sentence_list(blob):
+            if len(s) >= 20:
+                intro.append(s)
+            if len(intro) >= 3:
+                break
+    archive["intro_paragraphs"] = intro[:3]
+    archive["核心产品"] = "、".join(archive.get("products", [])[:8])
+    archive["主要业务"] = archive.get("主要业务") or "、".join(archive.get("products", [])[:6])
+    return archive
+
+
+def merge_user_resources(archive, res_updates, buckets):
+    """用户资料优先、官网补充：图片前置用户素材，文档事实覆盖官网推断。"""
+    doc_texts = res_updates.get("_doc_texts") or []
+    user_intro, user_products, user_details = _docs_to_facts(doc_texts)
+    # 图片：用户素材在前，官网素材在后；同一文件名不重复。
+    for k in IMAGE_DIRS:
+        user_imgs = list(res_updates.get(k) or [])
+        site_imgs = list(buckets.get(k) or [])
+        seen = {it.get("file") for it in user_imgs}
+        merged = user_imgs + [it for it in site_imgs if it.get("file") not in seen]
+        archive[k] = merged
+    # 文本事实：用户资料优先
+    if user_intro:
+        archive["intro_paragraphs"] = (user_intro + [p for p in archive.get("intro_paragraphs", [])
+                                                       if normalize_key(p) not in {normalize_key(x) for x in user_intro}])[:3]
+    if user_products:
+        # 用户资料优先：官网产品仅作补充，且仅在官网可信时并入，避免低置信度误匹配站污染清单。
+        confidence = archive.get("置信度", "") or ""
+        site_ok = not confidence.startswith("低")
+        seen = {normalize_key(p) for p in user_products}
+        extra = [p for p in archive.get("products", [])
+                 if site_ok and normalize_key(p) not in seen] if site_ok else []
+        archive["products"] = user_products + extra
+    if user_details:
+        d = dict(archive.get("product_details") or {})
+        d.update(user_details)
+        archive["product_details"] = d
+    archive["核心产品"] = "、".join(archive.get("products", [])[:8])
+    return archive
+
+
+# ---- 用户资料摄入结束 ----------------------------------------------------
+
+
 def crawl_company(item, args, out_root):
     name = item["name"]
     archive = {
@@ -1310,13 +1710,32 @@ def crawl_company(item, args, out_root):
         "cert": [], "factory": [], "pages": [], "products": [], "errors": [],
         "about_text": "", "product_text": "", "home_text": "", "intro_paragraphs": [],
         "product_details": {}, "status": "partial", "状态原因": "",
+        "资料备注": "", "资料来源": "",
     }
+    # 先摄入用户资料：官网不可用时资料仍可产出，且资料优先级高于官网。
+    backup_root = Path(getattr(args, "backup_dir", "") or "")
+    resource_dir = (item.get("resource_dir") or "")
+    res_updates, res_notes = {"logo": [], "product": [], "cert": [], "factory": []}, {}
+    if resource_dir:
+        raw_home = out_root / safe_filename(name)
+        bhome = (backup_root / safe_filename(name)) if str(backup_root) else Path("")
+        res_updates, res_notes = ingest_resources(name, resource_dir, raw_home, bhome, args)
+        archive["资料来源"] = str(resource_dir)
+        archive["资料备注"] = resource_notes_summary(res_notes)
     discovered = discover_site(name, item.get("website", ""), args)
     archive["官网"] = discovered.get("url", "")
     archive["置信度"] = discovered.get("confidence", "")
     if discovered.get("error"):
         archive["errors"].append(discovered["error"])
+    has_resources = bool(res_updates.get("_doc_texts") or res_updates.get("logo")
+                         or res_updates.get("product") or res_updates.get("cert")
+                         or res_updates.get("factory"))
     if not discovered.get("url"):
+        if has_resources:
+            # 官网没找到，但用户资料可用：以资料成档。
+            archive["status"] = "resource_only"
+            archive["状态原因"] = "未确认官网，基于用户提供资料成档"
+            return finalize_resource_only(archive, res_updates, args)
         archive["status"] = "no_website"
         archive["状态原因"] = "本地发现与校验未确认官网"
         return archive
@@ -1324,6 +1743,10 @@ def crawl_company(item, args, out_root):
     if not home_page:
         home_page, r = fetch_page(archive["官网"], args)
         if not home_page:
+            if has_resources:
+                archive["status"] = "resource_only"
+                archive["状态原因"] = "官网不可访问，基于用户提供资料成档"
+                return finalize_resource_only(archive, res_updates, args)
             archive["status"] = "no_website"
             archive["状态原因"] = "官网页面不可访问：" + r.get("error", "")
             return archive
@@ -1426,12 +1849,12 @@ def crawl_company(item, args, out_root):
     archive["产业"] = guess_industry(" ".join(p.get("text", "") for p in pages))
     archive["地址"] = extract_address(pages)
     archive["核心产品"] = "、".join(archive["products"][:8])
-    for k, v in buckets.items():
-        archive[k] = v
-    total_images = sum(len(v) for v in buckets.values())
+    # 用户资料优先、官网补充：图片前置用户素材，文档事实覆盖官网推断。
+    merge_user_resources(archive, res_updates, buckets)
+    total_images = sum(len(archive.get(k) or []) for k in IMAGE_DIRS)
     if total_images == 0:
         archive["status"] = "empty_images"
-        archive["状态原因"] = "官网未抓到可归档图片"
+        archive["状态原因"] = "官网与用户资料均未提供可归档图片"
     elif archive["errors"] or len(archive["intro_paragraphs"]) < 3:
         archive["status"] = "partial"
         archive["状态原因"] = "抓取存在错误或中文简介不足三段"
@@ -1845,6 +2268,10 @@ def main():
                     help="Playwright 模式：auto=静态过薄时自动渲染（默认），on=强制渲染，off=只用静态")
     ap.add_argument("--html-dir", dest="html_dir", default="",
                     help="Codex 内置浏览器保存的离线 HTML 目录（含 manifest.json），网络/内核都不可用时兜底")
+    ap.add_argument("--resources", default="",
+                    help="用户资料总目录：每家企业一个任意命名子文件夹，或单家企业文件夹")
+    ap.add_argument("--backup-dir", dest="backup_dir", default="",
+                    help="原始资料备份目录（默认 <输出目录>\\原始资料备份，在 deliverable 之外）")
     ap.add_argument("--browser-probe", dest="browser_probe", action="store_true",
                     help="只探测渲染内核（chromium/msedge/msedge-exe/none）后退出")
     ap.add_argument("--require-visual", dest="require_visual", action="store_true",
@@ -1894,6 +2321,28 @@ def main():
         raise SystemExit("Excel 中没有可处理的企业名称")
     log(f"输入 {excel}")
     log(f"企业 {len(companies)} 家 · 本地输出 {out} · run_id {run_id}")
+
+    # 用户资料摄入：一个总目录，每家企业一个任意命名子文件夹。
+    args.backup_dir = str(Path(args.backup_dir).expanduser().resolve()) if args.backup_dir \
+        else str((out / "原始资料备份").resolve())
+    resource_map = {}
+    if args.resources:
+        res_root = Path(args.resources).expanduser().resolve()
+        if not res_root.is_dir():
+            raise SystemExit(f"找不到资料目录：{res_root}")
+        names = [c["name"] for c in companies]
+        resource_map = match_resource_dir(names, res_root)
+        # 单家企业：子目录匹配不到时，若总目录本身像企业文件夹则整体采用。
+        if not resource_map and len(companies) == 1:
+            resource_map[names[0]] = res_root
+        matched = len(resource_map)
+        log(f"资料目录 {res_root} · 匹配到 {matched}/{len(companies)} 家企业")
+        if matched < len(companies):
+            missing = [n for n in names if n not in resource_map]
+            log(f"  未匹配到资料的企业（仅官网）：{', '.join(missing[:10])}")
+    for item in companies:
+        item["resource_dir"] = str(resource_map.get(item["name"], "")) if resource_map else ""
+
     archives = []
     for i, item in enumerate(companies, 1):
         log(f"[{i}/{len(companies)}] {item['name']} ...")

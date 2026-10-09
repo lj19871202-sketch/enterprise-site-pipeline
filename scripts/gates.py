@@ -158,13 +158,17 @@ class Gate:
 # ---------------------------------------------------------------- 各门禁实现
 
 def gate_site_discovery(ctx):
-    """官网必须找到；自动发现低/中置信度必须由 Codex 打开确认。"""
-    bad, warn = [], []
+    """官网必须找到，或由用户资料独立成档；自动发现低/中置信度必须由 Codex 打开确认。"""
+    bad, warn, res_only = [], [], []
     for name, d in sorted(ctx["companies"].items()):
         site = str(d.get("官网") or "").strip()
         conf = str(d.get("置信度") or "").strip()
+        by_resource = str(d.get("status") or "").strip() == "resource_only"
         if not site:
-            bad.append(f"{name}: 未发现官网")
+            if by_resource:
+                res_only.append(f"{name}: 无官网，基于用户资料成档")
+            else:
+                bad.append(f"{name}: 未发现官网")
         elif conf.startswith("低") or "需复核" in conf:
             warn.append(f"{name}: 官网自动发现置信度低，Codex 需打开确认 {site}")
         elif conf.startswith("中"):
@@ -172,9 +176,10 @@ def gate_site_discovery(ctx):
     if bad:
         return Gate("site_discovery", "error", False,
                     f"官网未确认 {len(bad)} 家；需复核 {len(warn)} 家", bad + warn)
-    if warn:
+    if warn or res_only:
         return Gate("site_discovery", "warn", True,
-                    f"官网均已找到；{len(warn)} 家置信度中/低，Codex 需打开确认", warn)
+                    f"官网均已确认；{len(warn)} 家置信度中/低需复核，"
+                    f"{len(res_only)} 家仅凭用户资料成档", warn + res_only)
     return Gate("site_discovery", "error", True,
                 f"{len(ctx['companies'])} 家官网已确认", [])
 
@@ -298,12 +303,16 @@ def gate_image_required(ctx):
 
 
 def gate_image_provenance(ctx):
-    bad, offsite = [], []
+    bad, offsite, user_src = [], [], []
     for name, d in sorted(ctx["companies"].items()):
         site_host = host_of(d.get("官网", ""))
         for cat, folder in DIRS2.items():
             for it in d.get(cat) or []:
                 label = f"{name}/{folder}/{it.get('file', '?')}"
+                # 用户资料图片没有官网来源页，来源由资料目录承担，按用户资料优先通过。
+                if str(it.get("source") or "") == "用户资料":
+                    user_src.append(f"{label}: 用户资料 {it.get('from', '')}")
+                    continue
                 frm = it.get("from", "")
                 fh = host_of(frm)
                 if not frm:
@@ -313,7 +322,8 @@ def gate_image_provenance(ctx):
                 uh = host_of(it.get("url", ""))
                 if uh and site_host and not same_host(uh, site_host):
                     offsite.append(f"{label}: 图片直链 {uh}")
-    detail = f"来源页非官网 {len(bad)} 条；图片直链外域 {len(offsite)} 条（CDN 需人工确认）"
+    detail = (f"来源页非官网 {len(bad)} 条；图片直链外域 {len(offsite)} 条（CDN 需人工确认）；"
+              f"用户资料图 {len(user_src)} 条（按资料优先通过）")
     return Gate("image_provenance", "error", not bad, detail, bad + offsite)
 
 
@@ -634,6 +644,27 @@ def gate_visual_review(ctx):
     return Gate("visual_review", "warn", True, f"{len(ctx['companies'])} 家视觉核对完成")
 
 
+def gate_resource_intake(ctx):
+    """用户资料摄入必须留痕：未归类/抽取失败按告警列出，仅资料成档的企业单列。"""
+    warn, res_only = [], []
+    for name, d in sorted(ctx["companies"].items()):
+        src = str(d.get("资料来源") or "").strip()
+        note = str(d.get("资料备注") or "").strip()
+        if not src:
+            continue
+        if "未归类" in note or "失败" in note:
+            warn.append(f"{name}: {note}")
+        if str(d.get("status") or "").strip() == "resource_only":
+            res_only.append(f"{name}: 无官网，仅凭用户资料成档")
+    if warn:
+        return Gate("resource_intake", "warn", False,
+                    f"{len(warn)} 家企业资料存在未归类/抽取失败项（原件已备份，需人工确认）", warn + res_only)
+    if res_only:
+        return Gate("resource_intake", "warn", True,
+                    f"用户资料已摄入；{len(res_only)} 家仅资料成档（无官网事实）", res_only)
+    return Gate("resource_intake", "error", True, "用户资料摄入无未归类/抽取失败项", [])
+
+
 def gate_noise(ctx):
     bad = []
     for name in sorted(ctx["companies"]):
@@ -676,6 +707,7 @@ GATES = [
     gate_en_entry, gate_en_ascii, gate_en_pinyin,
     gate_product_en, gate_product_detail, gate_product_image_link, gate_product_rows, gate_product_map,
     gate_docx_sync, gate_docx_source,
+    gate_resource_intake,
     gate_noise, gate_summary, gate_visual_review,
 ]
 
