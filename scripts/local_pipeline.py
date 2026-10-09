@@ -1879,11 +1879,71 @@ def make_docx(path, archive, en_entry):
     doc.save(str(path))
 
 
-def product_image_links(archive):
-    """按图片 alt 与产品名匹配，返回 {产品名: [本地相对路径]}。
+def _product_match_keys(product):
+    """产品名的可匹配键：全名、系列/型号前缀、型号 token。"""
+    text = clean_inline(product)
+    keys = set()
+    for value in (text, product_series(text)):
+        key = normalize_key(value)
+        if len(key) >= 3:
+            keys.add(key)
+    # “储能柜 型号 ESS-100”这类名称，型号前的主体是有效的产品族匹配词。
+    base = re.split(r"\s*(?:型号|model|spec(?:ification)?)\s*", text, flags=re.I)[0]
+    base_key = normalize_key(base)
+    if len(base_key) >= 3:
+        keys.add(base_key)
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*|\d{2,}", text):
+        key = normalize_key(token)
+        if len(key) >= 3:
+            keys.add(key)
+    return keys
 
-    匹配优先级：完全一致 > 产品名是 alt 前缀 > 系列名匹配。
-    同一张图可被同系列多个产品共用；一个产品不会拿到多张无关图。
+
+def _product_image_keys(item):
+    """从图片 alt、文件名、来源路径和 URL 提取匹配文本。"""
+    keys = set()
+    texts = [
+        item.get("alt", ""),
+        Path(clean_inline(item.get("file", ""))).stem,
+        item.get("from", ""),
+        item.get("url", ""),
+    ]
+    for text in texts:
+        text = clean_inline(text)
+        if not text:
+            continue
+        pieces = [text] + re.split(r"[\\/|]+", text)
+        for piece in pieces:
+            piece = re.sub(r"^user[_-]+", "", piece, flags=re.I)
+            piece = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", piece)
+            key = normalize_key(piece)
+            if len(key) >= 2:
+                keys.add(key)
+            for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*", piece):
+                token_key = normalize_key(token)
+                if len(token_key) >= 2:
+                    keys.add(token_key)
+    return keys
+
+
+def _product_image_match_score(product_keys, candidate_keys):
+    """完全匹配优先，其次才接受产品名/系列名/型号与图片元数据互相包含。"""
+    best = 0
+    for pkey in product_keys:
+        for ckey in candidate_keys:
+            if pkey == ckey:
+                best = max(best, 3)
+            elif len(pkey) >= 3 and len(ckey) >= 3 and (pkey in ckey or ckey in pkey):
+                best = max(best, 2)
+    return best
+
+
+def product_image_links(archive):
+    """按图片元数据匹配产品名，返回 {产品名: [本地相对路径]}。
+
+    匹配优先级：alt/文件名/来源路径/URL 完全一致 > 产品主体或型号包含匹配。
+    用户资料只有一张产品图且无法精确匹配时，作为未匹配产品行的主图兜底，
+    保证产品清单仍有可核验的本地链接；多张图无法唯一匹配时不强行复用。
     """
     folder = IMAGE_DIRS["product"]
     candidates = []
@@ -1891,26 +1951,41 @@ def product_image_links(archive):
         file_name = clean_inline(item.get("file", ""))
         if not file_name:
             continue
-        candidates.append({"rel": f"{folder}/{file_name}", "key": normalize_key(item.get("alt", ""))})
+        keys = _product_image_keys(item)
+        if not keys:
+            continue
+        candidates.append({
+            "rel": f"{folder}/{file_name}",
+            "keys": keys,
+            "source": clean_inline(item.get("source", "")),
+        })
     result = {}
-    for product in archive.get("products") or []:
-        pkey = normalize_key(product)
-        spkey = normalize_key(product_series(product))
-        matches = []
-        if pkey:
-            matches = [c for c in candidates if c["key"] == pkey]
-        if not matches and pkey:
-            matches = [c for c in candidates if c["key"] and len(pkey) >= 4 and pkey in c["key"]]
-        if not matches and spkey and len(spkey) >= 4:
-            matches = [c for c in candidates if c["key"] and (spkey in c["key"] or c["key"] in spkey)]
-        if not matches and pkey:
-            matches = [c for c in candidates if c["key"] and len(c["key"]) >= 4 and c["key"] in pkey]
+    products = list(archive.get("products") or [])
+    product_keys = {product: _product_match_keys(product) for product in products}
+    for product in products:
+        scored = []
+        for cand in candidates:
+            score = _product_image_match_score(product_keys[product], cand["keys"])
+            if score:
+                scored.append((score, cand))
+        if scored:
+            best_score = max(x[0] for x in scored)
+            matches = [x[1] for x in scored if x[0] == best_score]
+        else:
+            matches = []
         rels, seen_rel = [], set()
         for cand in matches:
             if cand["rel"] not in seen_rel:
                 seen_rel.add(cand["rel"])
                 rels.append(cand["rel"])
         result[product] = rels
+
+    user_candidates = [c for c in candidates if c["source"] == "用户资料"]
+    unmatched = [p for p in products if not result.get(p)]
+    if len(user_candidates) == 1 and unmatched:
+        rel = user_candidates[0]["rel"]
+        for product in unmatched:
+            result[product] = [rel]
     return result
 
 
@@ -1939,7 +2014,13 @@ def make_product_xlsx(path, archive, en_entry):
         else:
             detail_cell = f"{NO_DETAIL_ZH}\n{NO_DETAIL_EN}"
         links = image_links.get(product) or []
-        img_cell = "\n".join(links) if links else "官网未提供产品图\nNo product image available on the official website"
+        if links:
+            img_cell = "\n".join(links)
+        elif archive.get("product"):
+            img_cell = ("未匹配到本产品对应的本地图片（请人工确认产品图）\n"
+                        "No product-specific local image matched; manual confirmation required")
+        else:
+            img_cell = "官网未提供产品图\nNo product image available on the official website"
         ws.append([archive.get("产业", ""), i, cell, brand, "", "", detail_cell, img_cell])
         if links:
             img_cell_obj = ws.cell(row=ws.max_row, column=8)
@@ -2027,7 +2108,14 @@ def render_stage(stage, archives, en_data):
                 for image in source.iterdir():
                     if image.is_file():
                         shutil.copy2(image, target / image.name)
-        make_docx(home / "5.企业介绍" / f"{safe_filename(a['名称'])}简介（{_dt.date.today():%Y%m%d}短）.docx", a, en_data.get(a["名称"]))
+        intro_dir = home / "5.企业介绍"
+        intro_dir.mkdir(parents=True, exist_ok=True)
+        for stale in intro_dir.glob(f"{safe_filename(a['名称'])}简介*短*.docx"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        make_docx(intro_dir / f"{safe_filename(a['名称'])}.docx", a, en_data.get(a["名称"]))
         make_product_xlsx(home / "产品清单.xlsx", a, en_data.get(a["名称"]))
     write_json(stage / "en.json", en_data)
     make_summary(stage / "汇总.xlsx", archives, en_data)

@@ -225,8 +225,17 @@ def gate_structure(ctx):
             continue
         missing = [d for d in COMPANY_DIRS if not os.path.isdir(os.path.join(home, d))]
         intro_dir = os.path.join(home, "5.企业介绍")
-        if os.path.isdir(intro_dir) and not glob.glob(os.path.join(intro_dir, "*.docx")):
-            missing.append("简介docx")
+        expected_docx = os.path.join(intro_dir, company_dir_name(name) + ".docx")
+        if os.path.isdir(intro_dir):
+            if not os.path.isfile(expected_docx):
+                missing.append(f"企业介绍/{company_dir_name(name)}.docx")
+            wrong_docx = [
+                os.path.basename(fp)
+                for fp in glob.glob(os.path.join(intro_dir, "*.docx"))
+                if os.path.normcase(os.path.abspath(fp)) != os.path.normcase(os.path.abspath(expected_docx))
+            ]
+            if wrong_docx:
+                bad.append(f"{name}/5.企业介绍:docx 文件名必须与企业文件夹一致，发现 {','.join(sorted(wrong_docx))}")
         if not os.path.isfile(os.path.join(home, "产品清单.xlsx")):
             missing.append("产品清单.xlsx")
         if missing:
@@ -481,8 +490,10 @@ def gate_product_image_link(ctx):
             if "本地抓取，待核验" in text:
                 bad.append(f"{name} 行{r}: 仍是旧占位文字")
                 continue
-            if "官网未提供产品图" in text or "No product image available" in text:
-                no_image.append(f"{name} 行{r}: 官网未提供产品图")
+            if (("官网未提供产品图" in text) or ("No product image available" in text)
+                    or ("未匹配到本产品对应的本地图片" in text)
+                    or ("No product-specific local image matched" in text)):
+                no_image.append(f"{name} 行{r}: 未匹配到对应产品图（已显式标注，需人工确认）")
                 continue
             refs = [x.strip().replace("\\", "/") for x in raw.splitlines() if x.strip()]
             missing = []
@@ -496,7 +507,7 @@ def gate_product_image_link(ctx):
                 linked += 1
     if bad:
         return Gate("product_image_link", "error", False, f"{len(bad)} 行图片本地链接无效", bad)
-    detail = f"本地链接 {linked}/{total} 行；官网无图 {len(no_image)} 行（已显式标注）"
+    detail = f"本地链接 {linked}/{total} 行；未匹配到对应产品图 {len(no_image)} 行（已显式标注，需人工确认）"
     return Gate("product_image_link", "warn", not no_image, detail, no_image)
 
 
@@ -543,7 +554,9 @@ def gate_product_map(ctx):
 def gate_docx_sync(ctx):
     bad = []
     for name in sorted(ctx["companies"]):
-        hits = glob.glob(os.path.join(ctx["deliverable"], name, "5.企业介绍", "*.docx"))
+        intro_dir = os.path.join(ctx["deliverable"], name, "5.企业介绍")
+        expected = os.path.join(intro_dir, company_dir_name(name) + ".docx")
+        hits = [expected] if os.path.isfile(expected) else glob.glob(os.path.join(intro_dir, "*.docx"))
         if not hits:
             continue
         want = ((ctx["en"] or {}).get(name) or {}).get("英文简介") or []
@@ -562,7 +575,9 @@ def gate_docx_sync(ctx):
 def gate_docx_source(ctx):
     bad = []
     for name, d in sorted(ctx["companies"].items()):
-        hits = glob.glob(os.path.join(company_path(ctx["deliverable"], name), "5.企业介绍", "*.docx"))
+        intro_dir = os.path.join(company_path(ctx["deliverable"], name), "5.企业介绍")
+        expected = os.path.join(intro_dir, company_dir_name(name) + ".docx")
+        hits = [expected] if os.path.isfile(expected) else glob.glob(os.path.join(intro_dir, "*.docx"))
         if not hits:
             continue
         src = d.get("intro_paragraphs") or []

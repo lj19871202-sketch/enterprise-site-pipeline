@@ -41,7 +41,7 @@ python "$SkillRoot\scripts\gates.py" `
 |---|---|---|---|
 | `site_discovery` | error/warn | 官网必须发现；自动发现置信度为中/低时由 Codex 打开候选站点复核；`resource_only`（官网不可用但用户资料可用）单列告警 | 未发现 0 家（`resource_only` 除外）；中/低置信度仅告警 |
 | `coverage` | error | 档案、目录、英文、汇总四方企业集合一致，且数量等于 `expected_companies` | 差集为空 |
-| `structure` | error | 每家固定为五文件夹 + 产品清单 xlsx；企业根目录无多余项，五文件夹内只允许直接文件、不得嵌套子目录 | 缺失数 0、多余项 0、嵌套目录 0 |
+| `structure` | error | 每家固定为五文件夹 + 产品清单 xlsx；`5.企业介绍` 下 docx 文件名必须等于企业文件夹名；企业根目录无多余项，五文件夹内只允许直接文件、不得嵌套子目录 | 缺失数 0、多余项 0、错误 docx 名 0、嵌套目录 0 |
 | `images` | error | 档案里的图片引用都落到真实文件；交付目录里没有 raw 未记录的孤儿图；跨类重复图；四类图是否全空 | 失效引用 0、孤儿图 0、跨类重复组 0、四类全空 0 家 |
 | `image_required` | warn | 单独检查 `logo` 与 `factory` 两类是否有图；官网确实没有素材时保留告警并写数据边界，不硬性阻断 | 空类 0 条（否则告警） |
 | `image_provenance` | error | 每张官网图的来源页必须与官网同域；`source: 用户资料` 的图跳过同域校验并计入 `user_src` 提示；图片直链外域单独列出 | 来源页非官网 0 条（用户资料图、直链外域仅提示） |
@@ -50,7 +50,7 @@ python "$SkillRoot\scripts\gates.py" `
 | `en_pinyin` | warn | 英文段疑似拼音/栏目词 token 占比 | ≥ 0.60 告警 |
 | `product_en` | error/warn | 产品名称列必须为“中文/型号 / 英文名”格式，且 ` / ` 右侧含至少 2 个连续拉丁字母；只有显式 `--accept-no-english` 才降为 warn | 空英文行 0 |
 | `product_detail` | error/warn | `产品详情` 列非空行必须同时含中文和至少 3 个连续英文词；型号字母不算英文译文；无详情行不得留空，官网真实详情覆盖率低于阈值仅告警 | 缺中/英 0 行、空详情 0 行；覆盖率 ≥ 0.30 |
-| `product_image_link` | error/warn | `图片（本地连接）` 列必须指向交付目录内真实存在的相对路径；官网无图必须显式标注，旧占位符视为错误 | 无效/空/占位链接 0 行；官网无图行告警 |
+| `product_image_link` | error/warn | `图片（本地连接）` 列必须指向交付目录内真实存在的相对路径；无法唯一关联产品图时必须显式标注待人工确认，旧占位符视为错误 | 无效/空/占位链接 0 行；未匹配行告警 |
 | `product_rows` | error | `产品清单.xlsx` 数据行（按 ` / ` 取中文名）与 raw `products` 顺序逐行一致 | 不一致家数 0 |
 | `product_map` | error/warn | 档案产品在 `产品英名` 中的覆盖率；只有显式 `--accept-no-english` 才降为 warn | ≥ 0.80 |
 | `docx_sync` | error | docx 英文段与 `en.json` 英文简介逐字一致 | 不一致家数 0 |
@@ -72,7 +72,7 @@ python "$SkillRoot\scripts\gates.py" `
 
 **`product_detail`** —— `产品详情` 列不能只有中文，也不能是空白；至少要有 3 个连续英文词才算英文译文，中文详情中的 `WMS`、`GaN`、`5A` 等型号 token 不算。官网确实没有独立详情的分类/系列名行，写中英双语事实占位说明（“官网未提供独立产品详情 / No standalone product description...”），真实详情覆盖率作为告警线记录在 `企业说明` 页和门禁日志中，不允许为了凑覆盖率编造内容。
 
-**`product_image_link`** —— 产品清单的 `图片（本地连接）` 列必须能落到 `2.企业产品图/` 下的真实文件；能按 `alt` 匹配产品名时写相对路径并设为可点击链接。官网确实没有对应产品图时写“官网未提供产品图 / No product image available...”，显式告警但不伪造图片，不允许保留“本地抓取，待核验”这类占位文字。
+**`product_image_link`** —— 产品清单的 `图片（本地连接）` 列必须能落到 `2.企业产品图/` 下的真实文件；按 `alt`、文件名、来源路径和 URL 匹配产品名，也支持型号/产品主体包含匹配。用户资料只有一张产品图且无法精确匹配时，作为未匹配产品行的主图兜底；多张图无法唯一匹配时写“未匹配到本产品对应的本地图片 / No product-specific local image matched...”并告警，不伪造对应关系，也不允许保留“本地抓取，待核验”这类占位文字。
 
 **`docx_sync`** —— 防止“英文 JSON 改了、docx 没重渲染”。本地流水线每次从当前 `en.json` 重新生成 docx，门禁再逐家比对，避免交付旧英文。
 
