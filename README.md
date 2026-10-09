@@ -140,12 +140,12 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 ```text
 build/<run_id>/review/视觉核对图/<企业>/0.总览.png    # 四类速览
-build/<run_id>/review/视觉核对图/<企业>/<分类>.png     # 分类拼版（该类全部图片）
+build/<run_id>/review/视觉核对图/<企业>/<分类>.png     # 分类拼版（单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…）
 build/<run_id>/review/<企业>/图片核对表.xlsx           # 带缩略图，结论列可下拉
 build/<run_id>/视觉核对.json                           # 结论载体
 ```
 
-这一步由 Codex 自己做，不能把拼版甩给用户代看。Codex 先用图像查看工具打开总览初筛，再逐个打开分类拼版放大核对；读 `review/核对指引.md` 获取当前运行的企业、拼版绝对路径和 JSON 模板。结论写成 `verdicts.json` 后一键回写：
+这一步由 Codex 自己做，不能把拼版甩给用户代看。Codex 先用图像查看工具打开总览初筛，再逐个打开分类拼版放大核对（分页时同一分类的所有页都要看）；读 `review/核对指引.md` 获取当前运行的企业、拼版绝对路径和 JSON 模板。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以必须短线程分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。结论写成 `verdicts.json` 后一键回写：
 
 ```powershell
 python "$SkillRoot\scripts\visual_review.py" `

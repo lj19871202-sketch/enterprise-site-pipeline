@@ -93,7 +93,7 @@ python "$SkillRoot\scripts\gates.py" `
 ```text
 <run_id>/review/
 ├── 视觉核对图/<企业>/0.总览.png        # 四类速览
-├── 视觉核对图/<企业>/<分类>.png         # 分类拼版（该类全部图片）
+├── 视觉核对图/<企业>/<分类>.png         # 分类拼版（单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…）
 ├── <企业>/图片核对表.xlsx              # 带缩略图；结论列可下拉
 └── 核对指引.md                         # Codex 看图清单、判断口径和执行命令
 <run_id>/视觉核对.json                  # 结论载体，gates.py 读取
@@ -101,8 +101,10 @@ python "$SkillRoot\scripts\gates.py" `
 
 核对方式（Codex 直接把拼版当图片打开，逐张看，不得推给用户）：
 
+必须在短线程内完成：每批 ≤10 家，一个会话只做「看图 → 回写结论 → 跑门禁 → 发布」，做完即止。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以脚本把单页限制为 ≤12 张、≤1MB，图片多时按 `<分类>_p1.png`、`<分类>_p2.png` 分页，同一分类的所有页都要看。
+
 1. 打开 `review/核对指引.md`，按其中绝对路径打开 `<企业>/0.总览.png` 做初筛；
-2. 疑点打开 `<分类>.png` 放大确认；同时核对简介 docx 与产品清单内容；
+2. 疑点打开 `<分类>.png`（分页时为 `<分类>_p1.png`、`_p2.png`…，全看完）放大确认；同时核对简介 docx 与产品清单内容；
 3. 把结论写进 `review/verdicts.json`：可只写类别结论（该类未单独填写的图继承），也可写单张；然后执行 `visual_review.py --json "<run_id>/视觉核对.json" --apply "<run_id>/review/verdicts.json" --reviewer Codex` 回写；
 4. 执行 `gates.py --require-visual` 复核；全绿后用 `local_pipeline.py --publish-stage "<run_id>" --out "<输出目录>"` 发布。
 

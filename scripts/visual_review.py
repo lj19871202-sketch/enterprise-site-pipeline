@@ -5,7 +5,7 @@
 为每家企业生成"看图材料"和空结论载体，供 Codex（图像查看）或人工核对：
 
     <run>/review/视觉核对图/<企业>/0.总览.png      四类速览
-    <run>/review/视觉核对图/<企业>/<分类>.png       分类拼版（全部图片）
+    <run>/review/视觉核对图/<企业>/<分类>.png       分类拼版（单页≤12 张；超过则 <分类>_p1.png、_p2.png…）
     <run>/review/图片核对表.xlsx                    带缩略图 + 结论下拉
     <run>/视觉核对.json                             结论载体，供 gates.py 读取
 
@@ -137,7 +137,17 @@ def placeholder(box, text, fnt):
     return im
 
 
-def build_montage(records, out_path, title, subtitle):
+MAX_CELLS_PER_PAGE = 12
+MAX_PAGE_BYTES = 1_000_000
+
+
+def page_index(path):
+    """拼版页码，用于把 _p2 排在 _p10 前面；单页文件返回 1。"""
+    m = re.search(r"_p(\d+)$", Path(path).stem)
+    return int(m.group(1)) if m else 1
+
+
+def _render_montage_page(records, out_path, title, subtitle, page_note=""):
     from PIL import Image, ImageDraw
     cols, cell_w, cell_h = 4, 380, 430
     thumb_w, thumb_h, head = 340, 300, 116
@@ -150,6 +160,8 @@ def build_montage(records, out_path, title, subtitle):
     d.rectangle([0, 0, width, head], fill=(24, 64, 120))
     d.text((20, 16), title, font=tf, fill=(255, 255, 255))
     d.text((20, 68), subtitle, font=sf, fill=(214, 227, 245))
+    if page_note:
+        d.text((20, 90), page_note, font=sf, fill=(184, 205, 232))
     for i, rec in enumerate(records):
         row, col = divmod(i, cols)
         x, y = 10 + col * cell_w, head + row * cell_h
@@ -173,6 +185,60 @@ def build_montage(records, out_path, title, subtitle):
     canvas.save(str(out_path))
     canvas.close()
     return out_path
+
+
+def build_montage(records, out_path, title, subtitle,
+                  max_cells=MAX_CELLS_PER_PAGE, max_bytes=MAX_PAGE_BYTES):
+    """生成拼版图；单页超过 max_cells 张或 max_bytes 字节时自动分页。
+
+    返回写出的文件路径列表。单页沿用 out_path；分页时写成
+    ``<名称>_p1.png``、``<名称>_p2.png``…… 顺序与 records 一致。
+    分页是为了让 Codex 逐页看图时不会把超大拼版读进会话（历史事故：
+    146 张的产品拼版单张 13.6MB）。常规情况每页只渲染一次；只有某页
+    仍超 max_bytes 时才整体重排重渲染。
+    """
+    records = list(records or [])
+    if not records:
+        return []
+    out_path = Path(out_path)
+    for stale in out_path.parent.glob(f"{out_path.stem}*.png"):
+        stale.unlink()
+    tmp_dir = out_path.parent / f"{out_path.stem}.paged"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    pages = [records[i:i + max_cells] for i in range(0, len(records), max_cells)]
+    try:
+        while True:
+            for old in tmp_dir.glob(f"*{out_path.suffix}"):
+                old.unlink()
+            total = len(pages)
+            page_files = []
+            for i, page in enumerate(pages):
+                tmp_file = tmp_dir / f"{i:03d}{out_path.suffix}"
+                _render_montage_page(
+                    page, tmp_file, title, subtitle,
+                    f"第 {i + 1} / {total} 页（共 {len(records)} 张）" if total > 1 else "")
+                page_files.append(tmp_file)
+            oversized = [i for i, tmp_file in enumerate(page_files)
+                         if tmp_file.stat().st_size > max_bytes and len(pages[i]) > 1]
+            if not oversized:
+                break
+            for i in reversed(oversized):
+                page = pages[i]
+                half = len(page) // 2
+                pages[i:i + 1] = [page[:half], page[half:]]
+
+        total = len(pages)
+        paths = []
+        for i, tmp_file in enumerate(page_files):
+            dst = out_path if total == 1 else out_path.with_name(
+                f"{out_path.stem}_p{i + 1}{out_path.suffix}")
+            if dst.exists():
+                dst.unlink()
+            shutil.move(str(tmp_file), str(dst))
+            paths.append(dst)
+        return paths
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
 def company_records(deliverable, name, archive):
@@ -348,6 +414,7 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd):
         "",
         "本步骤不能交给用户代做，也不能把结论留成“待核对”后直接发布。",
         "Codex 必须自己打开下面每个拼版图，逐张判断图片是否属于该企业、是否属于该分类、是否为清晰可用素材。",
+        "必须在短线程内完成：每批 ≤10 家，一个会话只做「看图 → 回写结论 → 跑门禁 → 发布」，做完即止，不要在长会话里累积几十张拼版图片。",
         "",
         "## 每家企业",
         "",
@@ -356,13 +423,22 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd):
         base = review / "视觉核对图" / company_dir_name(name)
         total = sum(len(v) for v in records_by_cat.values())
         lines.append(f"### {name}（{total} 张）")
-        lines.append(f"- 总览：`{base / '0.总览.png'}`")
+        for page_path in sorted(base.glob("0.总览*.png"), key=page_index):
+            lines.append(f"- 总览：`{page_path}`")
         for folder in sorted(records_by_cat):
             items = records_by_cat[folder]
-            if items:
-                lines.append(f"- {folder}（{len(items)} 张）：`{base / (folder + '.png')}`")
+            if not items:
+                continue
+            pages = sorted(base.glob(f"{folder}*.png"), key=page_index)
+            lines.append(f"- {folder}（{len(items)} 张，{len(pages)} 页）：")
+            for page_path in pages:
+                lines.append(f"    - `{page_path}`")
         lines.append("")
     lines += [
+        "## 看图范围",
+        "",
+        "- 分类拼版单页最多 12 张；图片多时文件名为 `<分类>_p1.png`、`<分类>_p2.png`……同一分类的所有页都必须看完，不能只打开第 1 页。",
+        "",
         "## 判断口径",
         "",
         "- 企业logo：是否为该企业标识；不是则「不符」。",

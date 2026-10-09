@@ -150,16 +150,18 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 ```text
 <run_id>/review/视觉核对图/<企业>/0.总览.png
-<run_id>/review/视觉核对图/<企业>/<分类>.png
+<run_id>/review/视觉核对图/<企业>/<分类>.png    # 单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…
 <run_id>/review/<企业>/图片核对表.xlsx
 <run_id>/review/核对指引.md
 <run_id>/视觉核对.json
 ```
 
-流程由 Codex 自己执行，不得推给用户：
+流程由 Codex 自己执行，不得推给用户。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），因此必须在短线程内分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。
+
+步骤：
 
 1. Codex 打开 `review/核对指引.md`，按绝对路径逐家看图；
-2. 打开 `0.总览.png` 做初筛，疑点打开 `<分类>.png` 放大确认；同时核对简介 docx 和产品清单与原始页面是否一致；
+2. 打开 `0.总览.png` 做初筛，疑点打开 `<分类>.png`（分页时 `<分类>_p1.png`、`_p2.png`… 都要看）放大确认；同时核对简介 docx 和产品清单与原始页面是否一致；
 3. 把结论写进 `review/verdicts.json`，执行 `visual_review.py --json "<run_id>/视觉核对.json" --apply "<run_id>/review/verdicts.json" --reviewer Codex` 回写；
 4. 执行 `gates.py --require-visual` 复核，全绿后用 `local_pipeline.py --publish-stage "<run_id>" --out "<输出目录>"` 发布。
 
