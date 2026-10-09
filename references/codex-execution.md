@@ -270,7 +270,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | 视觉结论没回写 | `visual_review` 是否仍为 warn | 由 Codex 完成看图，写 `review\verdicts.json` 后执行 `visual_review.py --apply`；`--require-visual` 会把未完成核对判为 error |
 | 图片来源非官网 | `image_provenance` 的 offenders | 确认是否为企业自有站点或可信 CDN；别家站点图片必须剔除 |
 | 产品清单行数不符 | `product_rows`、raw `products` | 手工改过 xlsx 就重跑渲染，不要只改交付文件 |
-| 产品图本地链接为空/失效 | `product_image_link`、产品清单 `图片（本地连接）` | 检查 raw `product` 的 `alt`、文件名、来源路径、URL 是否含产品名/系列名/型号；用户资料仅一张产品图时允许作为主图兜底，多张无法唯一关联时保持“待人工确认”，不要乱配图或写旧占位符 |
+| 产品图本地链接为空/失效 | `product_image_link`、产品清单 `图片（本地连接）` | 检查 raw `product` 的 `alt`、文件名、来源路径、URL 是否含产品名/系列名/型号；用户资料仅一张产品图时允许作为主图兜底，多张无法唯一关联时该单元格留空，不要乱配图或写占位文字 |
 
 ## 九、安全约束
 

@@ -470,9 +470,9 @@ def gate_product_detail(ctx):
 
 
 def gate_product_image_link(ctx):
-    """产品图列必须是真实本地相对路径；官网无图必须显式标注。"""
+    """产品图列必须指向真实本地文件；无图时留空，不写占位文字。"""
     import openpyxl
-    bad, no_image = [], []
+    bad, blank = [], 0
     total = linked = 0
     for fp in glob.glob(os.path.join(ctx["deliverable"], "*", "产品清单.xlsx")):
         name = os.path.basename(os.path.dirname(fp))
@@ -489,15 +489,13 @@ def gate_product_image_link(ctx):
             total += 1
             text = norm_text(raw)
             if not text:
-                bad.append(f"{name} 行{r}: 本地链接为空")
+                blank += 1
                 continue
-            if "本地抓取，待核验" in text:
-                bad.append(f"{name} 行{r}: 仍是旧占位文字")
-                continue
-            if (("官网未提供产品图" in text) or ("No product image available" in text)
-                    or ("未匹配到本产品对应的本地图片" in text)
-                    or ("No product-specific local image matched" in text)):
-                no_image.append(f"{name} 行{r}: 未匹配到对应产品图（已显式标注，需人工确认）")
+            if ("本地抓取，待核验" in text or "官网未提供产品图" in text
+                    or "No product image available" in text
+                    or "未匹配到本产品对应的本地图片" in text
+                    or "No product-specific local image matched" in text):
+                bad.append(f"{name} 行{r}: 无图时应留空，不应使用占位文字")
                 continue
             refs = [x.strip().replace("\\", "/") for x in raw.splitlines() if x.strip()]
             missing = []
@@ -511,8 +509,8 @@ def gate_product_image_link(ctx):
                 linked += 1
     if bad:
         return Gate("product_image_link", "error", False, f"{len(bad)} 行图片本地链接无效", bad)
-    detail = f"本地链接 {linked}/{total} 行；未匹配到对应产品图 {len(no_image)} 行（已显式标注，需人工确认）"
-    return Gate("product_image_link", "warn", not no_image, detail, no_image)
+    detail = f"本地链接 {linked}/{total} 行；无图留空 {blank} 行"
+    return Gate("product_image_link", "warn", True, detail, [])
 
 
 def gate_product_rows(ctx):

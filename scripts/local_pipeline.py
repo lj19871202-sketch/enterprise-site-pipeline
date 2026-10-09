@@ -2014,13 +2014,8 @@ def make_product_xlsx(path, archive, en_entry):
         else:
             detail_cell = ""
         links = image_links.get(product) or []
-        if links:
-            img_cell = "\n".join(links)
-        elif archive.get("product"):
-            img_cell = ("未匹配到本产品对应的本地图片（请人工确认产品图）\n"
-                        "No product-specific local image matched; manual confirmation required")
-        else:
-            img_cell = "官网未提供产品图\nNo product image available on the official website"
+        # 来源没有对应产品图时直接留空，不写占位说明。
+        img_cell = "\n".join(links) if links else ""
         ws.append([archive.get("产业", ""), i, cell, brand, "", "", detail_cell, img_cell])
         if links:
             img_cell_obj = ws.cell(row=ws.max_row, column=8)
