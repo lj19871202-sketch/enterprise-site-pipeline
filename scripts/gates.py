@@ -158,8 +158,8 @@ class Gate:
 # ---------------------------------------------------------------- 各门禁实现
 
 def gate_site_discovery(ctx):
-    """官网必须找到，或由用户资料独立成档；自动发现低/中置信度必须由 Codex 打开确认。"""
-    bad, warn, res_only = [], [], []
+    """官网必须确认；中/低置信度未复核默认跳过，不得进入交付。"""
+    bad, review, res_only = [], [], []
     for name, d in sorted(ctx["companies"].items()):
         site = str(d.get("官网") or "").strip()
         conf = str(d.get("置信度") or "").strip()
@@ -169,17 +169,18 @@ def gate_site_discovery(ctx):
                 res_only.append(f"{name}: 无官网，基于用户资料成档")
             else:
                 bad.append(f"{name}: 未发现官网")
-        elif conf.startswith("低") or "需复核" in conf:
-            warn.append(f"{name}: 官网自动发现置信度低，Codex 需打开确认 {site}")
-        elif conf.startswith("中"):
-            warn.append(f"{name}: 官网自动发现置信度中 {site}")
-    if bad:
-        return Gate("site_discovery", "error", False,
-                    f"官网未确认 {len(bad)} 家；需复核 {len(warn)} 家", bad + warn)
-    if warn or res_only:
+        elif conf.startswith("中") or conf.startswith("低") or "需复核" in conf:
+            review.append(f"{name}: 官网置信度{conf or '未知'}，未复核不得采集 {site}")
+    if bad or review:
+        parts = []
+        if bad:
+            parts.append(f"官网未确认 {len(bad)} 家")
+        if review:
+            parts.append(f"中/低置信度未复核 {len(review)} 家")
+        return Gate("site_discovery", "error", False, "；".join(parts), bad + review)
+    if res_only:
         return Gate("site_discovery", "warn", True,
-                    f"官网均已确认；{len(warn)} 家置信度中/低需复核，"
-                    f"{len(res_only)} 家仅凭用户资料成档", warn + res_only)
+                    f"{len(res_only)} 家仅凭用户资料成档", res_only)
     return Gate("site_discovery", "error", True,
                 f"{len(ctx['companies'])} 家官网已确认", [])
 

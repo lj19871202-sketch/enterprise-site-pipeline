@@ -39,7 +39,7 @@ python "$SkillRoot\scripts\gates.py" `
 
 | id | 级别 | 判据 | 阈值 |
 |---|---|---|---|
-| `site_discovery` | error/warn | 官网必须发现；自动发现置信度为中/低时由 Codex 打开候选站点复核；`resource_only`（官网不可用但用户资料可用）单列告警 | 未发现 0 家（`resource_only` 除外）；中/低置信度仅告警 |
+| `site_discovery` | error/warn | 官网必须确认；自动发现置信度为中/低时未复核不得进入采集/交付，未复核企业应由主流程默认跳过；`resource_only`（官网不可用但用户资料可用）单列告警 | 未发现 0 家（`resource_only` 除外）；中/低置信度未复核 error |
 | `coverage` | error | 档案、目录、英文、汇总四方企业集合一致，且数量等于 `expected_companies` | 差集为空 |
 | `structure` | error | 每家固定为五文件夹 + 产品清单 xlsx；`5.企业介绍` 下 docx 文件名必须等于企业文件夹名；企业根目录无多余项，五文件夹内只允许直接文件、不得嵌套子目录 | 缺失数 0、多余项 0、错误 docx 名 0、嵌套目录 0 |
 | `images` | error | 档案里的图片引用都落到真实文件；交付目录里没有 raw 未记录的孤儿图；跨类重复图；四类图是否全空 | 失效引用 0、孤儿图 0、跨类重复组 0、四类全空 0 家 |
@@ -62,7 +62,7 @@ python "$SkillRoot\scripts\gates.py" `
 
 ## 关键门禁的意义
 
-**`site_discovery`** —— 官网是整条流水线的事实源。未发现官网直接 error；自动发现置信度为中/低时先 warn，Codex 必须打开候选站点核对，确认后再运行或补 Excel 官网列；不允许把低置信度结果静默当事实。若官网未确认或不可访问但用户资料可用，记 `resource_only`（仅凭用户资料成档），`site_discovery` 降为告警并单列，不算失败。
+**`site_discovery`** —— 官网是整条流水线的事实源。未发现官网且没有可用用户资料时 error；自动发现置信度为中/低时必须先复核，未填“决定/自定义官网”的企业由 `plan_site()` 默认跳过，不得进入 `raw` 或交付；若异常绕过主流程，`gates.py` 直接报 error。高置信度可自动采用。若官网未确认或不可访问但用户资料可用，记 `resource_only`（仅凭用户资料成档），`site_discovery` 降为告警并单列，不算失败。
 
 **`resource_intake`** —— 用户资料可能以任意目录结构、任意格式提交（图片/Word/Excel/PDF/PPT/txt…）。脚本递归扫描、按企业名匹配、按类别归档并抽取文本，原件备份在 `deliverable` 之外。无法归类或抽取失败的项会在 `资料备注` 记录并触发本门禁告警（不阻断交付），Codex 需人工确认这些项是否可忽略或需手工补录；原件始终保留在备份目录。
 

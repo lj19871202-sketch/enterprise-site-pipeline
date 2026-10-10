@@ -21,9 +21,21 @@
 | 示例科技有限公司 | https://example.com |
 | 示例实业有限公司 | |
 
-高/中置信度自动采用；低置信度会在门禁里列为需复核，由 Codex 打开站点确认后再交付。
+高置信度可自动采用；中、低置信度会停下来进入人工复核。推荐先运行 `--discover-only` / `-DiscoverOnly` 生成 `<输出目录>\官网候选复核表.xlsx`，在“决定”列选择 采用/跳过，或在“自定义官网”填写正确网址；留空＝未复核，中/低置信度默认跳过。
 
 企业已有资料时，用 `-Resources`（CLI：`--resources`）指向资料总目录：总目录下每家企业一个**任意命名**子文件夹，单家企业时也可直接传该企业文件夹。资料**不要求按规范结构**提交，格式除图片/Word/Excel 外还可能是 PDF、PPT、txt 等。冲突时**用户资料优先，官网只作补充**；原件会备份到 `<输出目录>\原始资料备份`（在 `deliverable` 之外，保留原目录结构）。
+
+官网两阶段复核：
+
+```powershell
+$SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
+# 1) 只发现官网，产出 <输出目录>\官网候选复核表.xlsx
+& "$SkillRoot\scripts\run_local.ps1" -Excel "D:\path\企业名录.xlsx" -Out "D:\path\企业官网资料包" -DiscoverOnly
+
+# 2) 在复核表中对中/低置信度填写 采用/跳过，或填写“自定义官网”；留空默认跳过
+# 3) 按复核表正式构建
+& "$SkillRoot\scripts\run_local.ps1" -Excel "D:\path\企业名录.xlsx" -Out "D:\path\企业官网资料包" -SiteDecisions "D:\path\企业官网资料包\官网候选复核表.xlsx" -NoPublish
+```
 
 新环境先引导：创建技能独立 `.venv`，按 `requirements.lock.txt` 安装锁定依赖并自检（需联网；已在干净克隆上实测通过）。`run_local.ps1` 缺核心依赖时也会自动调用：
 
@@ -84,9 +96,11 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 │   ├── 视觉核对.json         # 图片/文档/产品的视觉核对结论
 │   ├── review/              # 拼版图 + 缩略图核对表 + 核对指引.md
 │   ├── 汇总.xlsx
+│   ├── 官网复核结果.json      # 跳过企业及原因；存在跳过项时生成
 │   ├── gates.json
 │   ├── gates.log
 │   └── manifest.json
+├── 官网候选复核表.xlsx        # --discover-only 生成的两阶段复核表
 ├── deliverable/             # 门禁通过后发布
 └── 原始资料备份/             # 用户提交的原始资料原件，保留原目录结构
 ```
@@ -98,6 +112,8 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | 选项 | 说明 |
 |---|---|
 | `-Limit N` / `--limit N` | 只处理前 N 家，建议先用 1–3 家试跑 |
+| `-DiscoverOnly` / `--discover-only` | 只做官网发现，产出 `<输出目录>\官网候选复核表.xlsx` 后退出 |
+| `-SiteDecisions <复核表>` / `--site-decisions <复核表>` | 读取“决定/自定义官网”；中/低置信度未复核默认跳过 |
 | `-Playwright` / `--playwright on` | 强制用 Playwright 渲染 JS 站点 |
 | `--playwright auto` | 默认：静态页面直接抓，内容过薄时自动改用 Playwright |
 | `-NoPlaywright` / `--playwright off` | 关闭 Playwright，只用静态抓取 |
@@ -129,7 +145,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - `5.企业介绍/<企业名>.docx` 文件名必须与企业文件夹名完全一致；docx 中文段必须等于 raw `intro_paragraphs`，产品清单数据行必须等于 raw `products`；`产品详情` 列只填官网或企业资料中真实存在的非空内容，非空时必须中英双语，来源无详情时留空且不得写占位说明；`图片（本地连接）` 列必须指向交付目录内真实存在的 `2.企业产品图/...` 文件；来源没有对应产品图时留空，不得写占位说明；
 - 英文默认自动中译英并写入正文，`en.json` 标 `自动翻译: true` 待人工核校；提供 `--en` 后覆盖，人工确认稿标 `定稿: true`，MyMemory 失败时由 Codex 补翻的草稿仍标 `定稿: false`；
 - 英文缺口会写入 `英文补译清单.json`；默认 `en_entry`、`en_ascii`、`product_en`、`product_map` 的缺失均为 error。`product_detail` 只要求非空真实详情具备英文，来源无详情留空不算缺口；只有用户明确接受中文版时，`--accept-no-english` 才把英文检查降为告警；
-- 官网必须找到；自动发现置信度为低/中时列出，低置信度由 Codex 打开站点复核。官网未确认或不可访问但用户资料可用时，记 `resource_only`（仅凭用户资料成档），降为告警；
+- 官网必须确认；中/低置信度未复核的企业在进入门禁前已默认跳过，若异常进入 `raw`/交付，`site_discovery` 直接报 error。官网未确认或不可访问但用户资料可用时，记 `resource_only`（仅凭用户资料成档），降为告警；
 - `resource_intake` 门禁检查用户资料摄入：未归类 / 抽取失败项会列出告警（原件已备份）；用户资料图跳过官网同域校验（`image_provenance`）；
 - 汇总表、档案、目录和英文集合必须一致；
 - 图片内容需视觉核对，结论写入 `视觉核对.json`：标“不符”即报红，未核对默认告警；加 `--require-visual` 后未核对直接报红。
@@ -164,12 +180,12 @@ python "$SkillRoot\scripts\gates.py" --deliverable "<...>\deliverable" --raw "<.
 ## 已知边界
 
 - 抓取默认 `auto`：静态页面直接抓，疑似 JS 渲染页自动用 Playwright 重抓。`run_local.ps1` 会优先复用本机已有 Playwright；渲染内核先试内置 Chromium，不可用时自动改用本机 Microsoft Edge（Windows 自带，不需要下载 Chromium），两者都没有才下载。网络受限无法安装时加 `-NoPlaywrightInstall` 显式降级为静态抓取；Chromium/Edge 都不可用时，可用 Codex 内置浏览器保存渲染后的 HTML，加 `-HtmlDir` 走离线快照兜底。
-- 自动官网发现依赖搜索引擎可达性；置信度低时 Codex 必须打开候选站点复核，完全找不到才标 `no_website`。
+- 自动官网发现依赖搜索引擎可达性；中/低置信度必须先复核，完全找不到才标 `no_website`。推荐先跑 `-DiscoverOnly` 生成复核表，再通过 `-SiteDecisions` 正式构建。
 - 英文默认走 MyMemory 免费接口自动中译英。该接口有每日匿名额度，批量较大时部分条目可能翻译失败：失败条目在 `en.json` 标 `翻译失败: true`，并写入 `英文补译清单.json`；自检中的 429 是可恢复 `WARN`，不是环境致命错误。默认门禁阻断发布，Codex 必须基于中文事实生成 `--en` 补译草稿并保留 `定稿: false`、`自动翻译: true`、`备注: 待人工核校`。只有用户明确接受中文版时才可使用 `--accept-no-english`。
 - 输入格式当前以 `.xlsx` / `.xlsm` 为主；老式 `.xls` 请先另存为 `.xlsx`。
 - **新环境可复现性（已实测）。** 在全新克隆、无 `.venv` 的目录上跑 `bootstrap.ps1`（从 PyPI 装锁定依赖）后再用 `run_local.ps1`，含官网场景与"仅资料、无官网"（`resource_only`）场景均门禁全绿、退出码 0；交付严格为"五文件夹 + 产品清单.xlsx"、五个文件夹内零子目录，PDF/PPT/DOCX/XLSX 原件只落在 `deliverable` 之外的 `原始资料备份/`。该结论是干净克隆模拟，不等同于全新物理机。
 - **必须联网。** `bootstrap.ps1` 从 PyPI 安装依赖、官网抓取、MyMemory 翻译都依赖网络；断网环境需预先离线装好依赖与渲染内核，并自行准备离线 HTML 快照（`-HtmlDir`）。
 - **PDF 抽取是尽力而为。** 环境有 `pypdf`/`PyPDF2` 时抽前 20 页；没有时 PDF 只归档并在 `资料备注` 记"PDF 未抽到文本"，不阻断主流程。PPTX 用 zipfile+XML 抽文本，不依赖 `python-pptx`。
-- **必须由 Codex 复核的项**（脚本只给告警，不算失败）：官网自动发现置信度为低/中时须打开站点确认；`visual_review` 必须看图回写结论后才能发布；图片直链走 CDN 的外域需人工确认。
+- **必须由 Codex 复核的项**：官网自动发现置信度为中/低时须打开站点确认并填写复核表，未复核默认跳过；`visual_review` 必须看图回写结论后才能发布；图片直链走 CDN 的外域需人工确认。
 
 详细说明见 `SKILL.md` 和 `references/`。

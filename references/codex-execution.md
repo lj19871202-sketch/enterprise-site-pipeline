@@ -96,7 +96,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
    引导会创建技能独立 `.venv`、按 `requirements.lock.txt` 安装依赖并运行自检。自检覆盖 Python 依赖（openpyxl / python-docx / Pillow / playwright）、渲染内核（内置 Chromium 或本机 Edge）、本机出网、MyMemory 中译英、Excel 可读性、前 3 家官网可达性或自动发现结果。任何 `[FAIL]` 都先修再跑全量。MyMemory 429/限流是 `[WARN]` 可恢复告警，不阻止对新环境的基本判定；正式生成如仍失败，会写 `英文补译清单.json`，由 Codex 补 `--en`。
 1. Excel 第一个工作表包含表头；企业名称列名可用 `企业名称`、`公司名称`、`单位名称` 或 `名称`。
 2. 用户资料可选，通过 `-Resources` 指向总目录；每家企业一个任意命名子文件夹（脚本先剥离"资料/文件/材料"等词、再用企业全称/核心名/品牌词匹配），单家企业时总目录本身可就是企业文件夹。资料不要求按规范结构提交，格式除图片/Word/Excel 外还可能是 PDF/PPT/txt；原件在 `deliverable` 之外备份。冲突时用户资料优先，官网只作补充。
-3. 官网列可选，列名可用 `官网`、`网址`、`网站`、`官网地址`。没有官网列时，脚本会用企业全称和去地域核心名做多引擎搜索，并按域名与公司名共现、站点内容命中综合打分自动发现官网；低/中置信度结果由 Codex 打开候选站点复核后再进入正式交付，不能把低置信度结果直接当事实。
+3. 官网列可选，列名可用 `官网`、`网址`、`网站`、`官网地址`。没有官网列时，先运行 `--discover-only` 生成《官网候选复核表.xlsx》；脚本会用企业全称和去地域核心名做多引擎搜索，并按域名与公司名共现、站点内容命中综合打分。高置信度可自动采用，中/低置信度必须由 Codex 或用户复核；未填“决定/自定义官网”的中/低置信度企业默认跳过，不能把结果直接当事实。
 4. JS 渲染站默认走 `--playwright auto`：普通站先静态抓取，页面内容过薄且本机 Playwright 可用时自动渲染重抓；需要强制渲染用 `on`，离线排障用 `off`。
 5. 输出目录不要指向 Excel 所在文件本身或已有重要交付目录。脚本会在输出目录下创建 `build/<run_id>/`。
 
@@ -106,6 +106,8 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 |---|---|
 | `--selftest` | 只做环境自检后退出；可不带 `--excel` |
 | `--limit N` | 只跑前 N 家企业；`0` 为全部 |
+| `--discover-only` | 只做官网发现，产出 `<输出目录>\官网候选复核表.xlsx` 后退出 |
+| `--site-decisions FILE` | 读回官网复核表；中/低置信度未复核默认跳过 |
 | `--timeout N` | 单次请求超时秒数，默认 20 |
 | `--max-pages N` | 每家企业最多抓多少页，默认 20；产品分类/列表页优先，并下钻一层补齐叶子分类 |
 | `--max-products N` | 最多保留多少产品名，默认 60 |
@@ -257,7 +259,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | 视觉核对材料没生成 | `visual_review` 门禁是否报错、Pillow 是否可导入 | 缺失 Pillow 时视觉材料会静默消失；装上 Pillow 后重跑，别把它当"没有疑点" |
 | 门禁通过但发布报错/没发布 | 控制台是否出现"发布目录被占用" | 被占用的 xlsx 关掉后重跑；或直接用自动改发的 `<输出>\publish_<run_id>\` |
 | 门禁红灯但退出码是 0 | 是否用了 `-AllowRed` 或没走 `run_local.ps1` | 去掉 `-AllowRed`，或给 `local_pipeline.py` 显式加 `--strict` |
-| 官网自动发现低/中置信度 | `gates.json` 的 `site_discovery`、`raw/<企业>.json` 的候选与分数 | 由 Codex 打开候选站点核对；确认后补 Excel 官网列或保留确认记录，不把低置信度结果直接当事实 |
+| 官网自动发现中/低置信度 | `gates.json` 的 `site_discovery`、`<run_id>/官网复核结果.json`、`raw/<企业>.json` 的候选与分数 | 先运行 `--discover-only`，在《官网候选复核表.xlsx》的“决定”列填 `采用`/`跳过`，或填“自定义官网”；未复核默认跳过，不进入采集 |
 | 图片为空 | 页面是否 JS 渲染、图片是否要求 Referer | 默认保持 `--playwright auto`；`run_local.ps1` 会复用或自动安装 Playwright，仍抓不到再人工补图并标注 |
 | 英文门禁红 | `en.json` 的 `翻译失败`、`英文补译清单.json`、`en_entry`、`en_ascii`、`product_detail` | 正常修复是 Codex 基于 raw 中文事实生成 `--en` 草稿并重跑（保留 `定稿: false`、`自动翻译: true`）；只有用户明确接受中文版才加 `--accept-no-english` |
 | 非空产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 429 在自检中为可恢复 `WARN`；正式生成会写英文补译清单。可稍后重跑、加 `--translate-email`，或由 Codex 补 `--en` 草稿；来源本来无详情时应留空，不算英文缺口 |
@@ -278,5 +280,5 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 不要求为了本流水线配置远端账号；
 - 不修改用户未指定的业务文件；
 - 不在门禁红色时把结果标成终稿；
-- 输入表缺官网列时先自动发现；低/中置信度域名必须由 Codex 打开站点复核，确认前不进入正式交付，不把低置信度结果直接当事实；
+- 输入表缺官网列时先自动发现；中/低置信度域名必须由 Codex 或用户复核，未复核默认跳过，确认前不进入正式交付；高置信度才可自动采用；
 - 视觉核对由 Codex 自己完成，不得把看图判断转交给用户；未回写结论的条目在 `--require-visual` 下按 error 处理。

@@ -53,16 +53,47 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 验证：`raw/<企业>.json` 出现 `资料来源`/`资料备注`；`<输出>/原始资料备份/<企业>/` 保留原结构；交付目录五文件夹中出现 `user_` 前缀图片。
 
-## 阶段 1 · 官网发现
+## 阶段 1 · 官网发现与人工复核
+
+官网发现采用两阶段流程，避免中/低置信度候选被静默当成事实：
+
+1. **发现阶段。** 运行 `--discover-only` / `-DiscoverOnly`，只搜索、抓取候选首页并打分，产出 `<输出目录>\官网候选复核表.xlsx`，不进入正式采集。
+2. **复核阶段。** 在复核表中查看建议官网、置信度、分数和候选列表：
+   - 中/低置信度：在“决定”列选择 `采用` 或 `跳过`；若建议官网不对，直接在“自定义官网”填正确网址；
+   - 高置信度：可留空，后续正式构建时自动采用；
+   - 留空＝未复核，中/低置信度默认跳过，不进入抓取和交付。
+3. **正式构建。** 用 `--site-decisions` / `-SiteDecisions` 读回复核表后再采集。优先级为“自定义官网 > 决定列 > 未复核默认规则”。
+
+```powershell
+$SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
+
+# 1) 只发现，生成复核表
+& "$SkillRoot\scripts\run_local.ps1" `
+  -Excel "D:\path\企业名录.xlsx" `
+  -Out "D:\path\企业官网资料包" `
+  -DiscoverOnly
+
+# 2) 人工填写 <输出目录>\官网候选复核表.xlsx
+
+# 3) 按复核表正式构建
+& "$SkillRoot\scripts\run_local.ps1" `
+  -Excel "D:\path\企业名录.xlsx" `
+  -Out "D:\path\企业官网资料包" `
+  -SiteDecisions "D:\path\企业官网资料包\官网候选复核表.xlsx" `
+  -NoPublish
+```
+
+发现规则：
 
 - Excel 提供官网时直接使用，并记录 `置信度: 用户提供`；
 - 未提供时，本机对企业全称和去地域核心名做多轮查询（`"X" 官网` / `"X" 官方网站` / `"X" ICP备案`），静态搜索 `sogou → 360 → bing → duckduckgo`；候选少于 3 个且 Playwright 可用时，再用 baidu/bing 渲染补搜；
 - 候选域名按搜索引擎命中次数 + 域名与公司名在同一结果片段中的共现次数加权排序；候选页面再用企业全称/核心名命中标题正文，并叠加地址、电话、备案、关于我们、版权所有等证据打分；
-- `score ≥ 80` 记 `高（自动发现）`，`50–79` 记 `中（自动发现）`，其余记 `低（自动发现，需复核）`；低/中置信度由 Codex 打开站点复核，不能直接当事实；
+- `score ≥ 80` 记 `高（自动发现）`；`50–79` 记 `中（自动发现，需复核）`；`< 50` 记 `低（自动发现，需复核）`。中/低置信度必须人工复核，不能直接当事实；
+- 若没有传复核表就正式运行，高置信度仍自动采用，中/低置信度直接跳过，并在 `<run_id>/官网复核结果.json` 写出跳过清单和原因；推荐始终先跑 `--discover-only`；
 - https 打不开的站自动回退 http（不少国内企业站只开 http），最终记录实际访问到的地址；
-- 未命中的企业保留 `status: no_website`，不能静默丢失；但若该企业有可用用户资料，则记 `status: resource_only`（仅凭用户资料成档），不算失败。
+- 未发现可复核官网时：有用户资料则记 `status: resource_only`（仅凭用户资料成档），不算失败；无用户资料则跳过并写入 `<run_id>/官网复核结果.json`，不生成 `raw`。用户提供或人工确认的官网不可访问且无用户资料时才保留 `status: no_website`。
 
-验证：查看 `raw/<企业>.json` 中的 `官网`、`置信度`、`errors`。
+验证：`--discover-only` 后检查 `<输出目录>\官网候选复核表.xlsx`；正式运行后查看 `raw/<企业>.json` 的 `官网`、`置信度`、`errors`，以及 `<run_id>/官网复核结果.json`。
 
 ## 阶段 2 · 页面抓取
 
@@ -97,7 +128,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 - 图片：用户素材排在官网素材之前，交付五文件夹中用户图片保留 `user_` 前缀；
 - 文本：用户资料提取的简介/产品/详情覆盖官网推断，官网只补充用户没有的项；
-- 若官网为"低（自动发现，需复核）"置信度，则**不并入**官网产品，避免误匹配站污染清单。
+- 中/低置信度未复核的官网不会进入本阶段；若异常进入 raw，`site_discovery` 会报 error，且**不并入**官网产品，避免误匹配站污染清单。
 
 从官网抓取的图片处理：
 
@@ -196,7 +227,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 处理规则：
 
 - 所有 error 项通过后，才把 stage 发布到输出目录 `deliverable/`；
-- 官网未发现时 `site_discovery` 为 error；自动发现置信度为中/低时先 warn，Codex 必须打开候选站点复核；
+- 官网未发现时 `site_discovery` 为 error；中/低置信度未复核的官网若异常进入 raw/交付也会直接 error；正常情况下未复核企业在采集前已跳过；
 - `visual_review` 标“不符”必红；未核对默认告警，`--require-visual` 时按 error；
 - 自动翻译失败或英文缺失时 `en_entry`/`en_ascii`/`product_en`/`product_detail`/`product_map` 默认报红，并生成 `英文补译清单.json`；正常修复是用 `--en` 提供补译草稿或人工定稿后重跑；
 - 只有用户在当次对话中明确接受中文版时，才可加 `--accept-no-english` 将英文相关门禁降为告警；
@@ -207,7 +238,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 1. 输入 Excel 行数与 `manifest.json` 的企业数一致；
 2. `gates.json` 没有未解释的 error；
-3. `no_website`、`empty_images`、`partial` 清单可追溯；自动发现的官网置信度为高，或中/低已由 Codex 打开复核；
+3. `no_website`、`empty_images`、`partial` 清单可追溯；自动发现的官网置信度为高，或中/低已经填写复核表并明确“采用/自定义官网”；未复核项应出现在 `官网复核结果.json` 的跳过清单中；
 4. 默认交付必须英文完整：`英文补译清单.json` 无未处理项，英文是“已确认定稿”，或是已明确标注“自动翻译·待人工核校”的完整草稿；只有用户明确接受中文版时，才可保留 `accept_no_english` 的告警状态；
 5. 交付目录中的图片引用全部存在，图片、文档、产品清单均已在 `视觉核对.json` 标为“符合”；
 6. docx 中文段与 raw `intro_paragraphs`、产品清单行与 raw `products` 一致；

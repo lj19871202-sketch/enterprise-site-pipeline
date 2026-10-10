@@ -1073,38 +1073,215 @@ def site_score(name, page):
     return min(score, 120)
 
 
-def discover_site(name, provided, args):
-    """确认官网。有官网列时以用户提供为准；否则自动发现并分级置信度。"""
+def site_confidence(score):
+    """按候选首页得分分级：高分自动采用，中/低交由人工复核。"""
+    if score >= 80:
+        return "高（自动发现）"
+    if score >= 50:
+        return "中（自动发现，需复核）"
+    return "低（自动发现，需复核）"
+
+
+def discover_site(name, provided, args, confidence=""):
+    """确认官网。有官网列时以用户提供为准；否则自动发现并分级置信度。
+
+    返回值含逐候选分数（`candidates`），供 --discover-only 生成复核表。
+    """
     if provided:
         url = norm_url(provided.split(",")[0].strip())
         page, r = fetch_site(url, args)
+        conf = confidence or "用户提供"
         if page:
-            return {"url": page["url"], "confidence": "用户提供", "page": page, "error": ""}
-        return {"url": url, "confidence": "用户提供", "page": None,
-                "error": r.get("error", "页面不可访问")}
+            return {"url": page["url"], "confidence": conf, "page": page,
+                    "error": "", "candidates": []}
+        return {"url": url, "confidence": conf, "page": None,
+                "error": r.get("error", "页面不可访问"), "candidates": []}
     candidates = search_candidates(name, args)
-    best = None
-    errors = []
+    scored, errors = [], []
     for url in candidates:
         page, r = fetch_site(url, args)
         if not page:
             errors.append(f"{url}: {r.get('error', '不可访问')}")
             continue
         score = site_score(name, page)
-        if score and (best is None or score > best[0]):
-            best = (score, page, url)
-    if best:
-        score, page, url = best
-        real_url = page.get("url") or url
-        if score >= 80:
-            confidence = "高（自动发现）"
-        elif score >= 50:
-            confidence = "中（自动发现）"
+        if score:
+            scored.append({"url": page.get("url") or url, "score": score,
+                           "title": clean_inline(page.get("title", "")), "page": page})
+    scored.sort(key=lambda x: -x["score"])
+    if scored:
+        best = scored[0]
+        return {"url": best["url"], "confidence": site_confidence(best["score"]),
+                "page": best["page"], "error": "", "score": best["score"],
+                "candidates": [{k: v for k, v in c.items() if k != "page"} for c in scored]}
+    return {"url": "", "confidence": "", "page": None,
+            "error": "; ".join(errors[:3]), "candidates": []}
+
+
+SITE_REVIEW_HEADERS = [
+    "企业名称", "建议官网", "置信度", "分数", "候选官网", "决定", "自定义官网", "备注",
+]
+# 复核表「决定」列的识别词；留空＝未复核。
+_SKIP_WORDS = {"跳过", "排除", "不采用", "否", "skip", "exclude", "no"}
+_ADOPT_WORDS = {"采用", "确认", "是", "adopt", "yes", "y"}
+
+
+def write_site_review(path, rows):
+    """写官网候选复核表：决定列留空时，中/低置信度企业默认跳过。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.worksheet.datavalidation import DataValidation
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "官网复核"
+    ws.append(SITE_REVIEW_HEADERS)
+    for r in rows:
+        ws.append(r)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(vertical="center", wrap_text=True)
+    ws.freeze_panes = "A2"
+    dv = DataValidation(type="list", formula1='"采用,跳过"', allow_blank=True,
+                        showDropDown=False)
+    ws.add_data_validation(dv)
+    dv.add(f"F2:F{max(ws.max_row, 2)}")
+    for col, width in zip("ABCDEFGH", (28, 34, 24, 8, 60, 10, 34, 24)):
+        ws.column_dimensions[col].width = width
+    for row in ws.iter_rows(min_row=2):
+        for c in row:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+    ws2 = wb.create_sheet("使用说明")
+    for line in (
+        "1. 本表由 local_pipeline.py --discover-only 生成，列出各企业的自动发现候选与分数。",
+        "2. 复核候选站点后，在「决定」列选择 采用 / 跳过；也可在「自定义官网」填正确网址（优先于「决定」）。",
+        "3. 决定留空＝未复核：高置信度自动采用，中/低置信度默认跳过，不进入采集。",
+        "4. 填好后运行：local_pipeline.py --excel <输入.xlsx> --site-decisions <本表.xlsx>",
+        "5. 未出现在本表的企业按未复核处理，中/低置信度同样跳过。",
+        "6. 候选分数规则见 references/pipeline.md 阶段 1：≥80 高，50-79 中，<50 低。",
+    ):
+        ws2.append([line])
+    ws2.column_dimensions["A"].width = 110
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+
+
+def load_site_decisions(path):
+    """读回官网复核表的决定，返回 {企业名称: {建议官网, 置信度, 分数, 决定, 自定义官网}}。"""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb["官网复核"] if "官网复核" in wb.sheetnames else wb.active
+        rows = ws.iter_rows(values_only=True)
+        try:
+            hdr = [str(c or "").strip() for c in next(rows)]
+        except StopIteration:
+            return {}
+
+        def idx(name, fallback):
+            return hdr.index(name) if name in hdr else fallback
+
+        def cell(row, i):
+            if i is None or i >= len(row) or row[i] is None:
+                return ""
+            return clean_inline(str(row[i]))
+
+        i_name, i_site = idx("企业名称", 0), idx("建议官网", 1)
+        i_conf, i_score = idx("置信度", 2), idx("分数", 3)
+        i_dec, i_custom = idx("决定", 5), idx("自定义官网", 6)
+        out = {}
+        for row in rows:
+            name = cell(row, i_name)
+            if not name:
+                continue
+            out[name] = {
+                "建议官网": cell(row, i_site),
+                "置信度": cell(row, i_conf),
+                "分数": cell(row, i_score),
+                "决定": cell(row, i_dec),
+                "自定义官网": cell(row, i_custom),
+            }
+        return out
+    finally:
+        wb.close()
+
+
+def plan_site(item, decisions, args):
+    """决定单家企业是否采集、用哪个官网。
+
+    用户提供官网直接采用；复核表决定优先；未复核时只有高置信度自动采用，
+    中/低置信度按“默认跳过”处理，不进入采集。
+    """
+    name = item["name"]
+    provided = clean_inline(item.get("website", ""))
+    if provided:
+        return {"action": "crawl", "source": "用户提供",
+                "discovery": discover_site(name, provided, args)}
+    dec = decisions.get(name) or {}
+    choice = clean_inline(str(dec.get("决定", ""))).lower()
+    custom = clean_inline(str(dec.get("自定义官网", "")))
+    if custom:
+        # 显式填写自定义官网是最强人工信号，优先于「决定」列。
+        return {"action": "crawl", "source": "人工确认",
+                "discovery": discover_site(name, custom, args, confidence="人工确认")}
+    if choice in _SKIP_WORDS:
+        return {"action": "skip", "reason": "复核决定：跳过"}
+    if choice in _ADOPT_WORDS:
+        url = clean_inline(str(dec.get("建议官网", "")))
+        if not url:
+            return {"action": "skip", "reason": "复核决定采用，但表内没有建议官网"}
+        return {"action": "crawl", "source": "人工确认",
+                "discovery": discover_site(name, url, args, confidence="人工确认")}
+    conf = clean_inline(str(dec.get("置信度", "")))
+    if conf:
+        # 复核表里已有结论：未填决定时只放行高置信度。
+        if conf.startswith("高"):
+            url = clean_inline(str(dec.get("建议官网", "")))
+            if url:
+                return {"action": "crawl", "source": "自动采用",
+                        "discovery": discover_site(name, url, args, confidence=conf)}
+        return {"action": "skip", "reason": f"未复核，自动发现置信度：{conf}"}
+    discovered = discover_site(name, "", args)
+    if discovered.get("url") and str(discovered.get("confidence", "")).startswith("高"):
+        return {"action": "crawl", "source": "自动采用", "discovery": discovered}
+    if not discovered.get("url") and item.get("resource_dir"):
+        # 没有官网候选可复核时仍保留“仅用户资料成档”路径。
+        return {"action": "crawl", "source": "仅用户资料", "discovery": discovered}
+    return {"action": "skip",
+            "reason": f"未复核，自动发现置信度：{discovered.get('confidence') or '未发现官网'}"}
+
+
+def run_discover_only(companies, args, out):
+    """两阶段流程的第一阶段：只做官网发现，产出候选复核表后退出。"""
+    rows = []
+    stats = collections.Counter()
+    for i, item in enumerate(companies, 1):
+        name = item["name"]
+        provided = clean_inline(item.get("website", ""))
+        d = discover_site(name, provided, args)
+        conf = d.get("confidence", "")
+        stats["用户提供" if provided else (conf or "未发现官网")] += 1
+        cands = d.get("candidates") or []
+        cand_text = "\n".join(f"{c.get('url', '')}（{c.get('score', '')}）" for c in cands[:8])
+        if provided:
+            note = "用户提供官网，无需复核"
+        elif d.get("url"):
+            note = "复核后填「决定」列；留空则中/低置信度默认跳过"
         else:
-            confidence = "低（自动发现，需复核）"
-        return {"url": real_url, "confidence": confidence, "page": page,
-                "error": "", "score": score}
-    return {"url": "", "confidence": "", "page": None, "error": "; ".join(errors[:3])}
+            note = (d.get("error", "") or "未发现候选官网")[:200]
+        rows.append([name, d.get("url", ""), conf, d.get("score", ""),
+                     cand_text, "", "", note])
+        log(f"[{i}/{len(companies)}] {name} → {d.get('url') or '未发现'}"
+            f"（{conf or '无'}）")
+    target = out / "官网候选复核表.xlsx"
+    if target.exists():
+        target = out / f"官网候选复核表.{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    write_site_review(target, rows)
+    log("\n官网发现统计：" + "；".join(f"{k} {v}" for k, v in stats.most_common()))
+    log(f"复核表：{target}")
+    log("请复核候选站点并在「决定」列填写 采用/跳过（留空＝未复核，中/低置信度将跳过），"
+        "然后运行：")
+    log(f'  local_pipeline.py --excel "<输入.xlsx>" --out "<输出目录>" '
+        f'--site-decisions "{target}"')
+    return 0
 
 
 def sentence_list(text):
@@ -1676,9 +1853,9 @@ def merge_user_resources(archive, res_updates, buckets):
         archive["intro_paragraphs"] = (user_intro + [p for p in archive.get("intro_paragraphs", [])
                                                        if normalize_key(p) not in {normalize_key(x) for x in user_intro}])[:3]
     if user_products:
-        # 用户资料优先：官网产品仅作补充，且仅在官网可信时并入，避免低置信度误匹配站污染清单。
+        # 用户资料优先：官网产品仅作补充，且仅在官网可信时并入，避免中/低置信度误匹配站污染清单。
         confidence = archive.get("置信度", "") or ""
-        site_ok = not confidence.startswith("低")
+        site_ok = not (confidence.startswith("中") or confidence.startswith("低") or "需复核" in confidence)
         seen = {normalize_key(p) for p in user_products}
         extra = [p for p in archive.get("products", [])
                  if site_ok and normalize_key(p) not in seen] if site_ok else []
@@ -1714,7 +1891,8 @@ def crawl_company(item, args, out_root):
         res_updates, res_notes = ingest_resources(name, resource_dir, raw_home, bhome, args)
         archive["资料来源"] = str(resource_dir)
         archive["资料备注"] = resource_notes_summary(res_notes)
-    discovered = discover_site(name, item.get("website", ""), args)
+    # 两阶段流程：发现/复核结果由 main 预置，避免重复搜索。
+    discovered = item.get("_site_discovery") or discover_site(name, item.get("website", ""), args)
     archive["官网"] = discovered.get("url", "")
     archive["置信度"] = discovered.get("confidence", "")
     if discovered.get("error"):
@@ -2326,6 +2504,10 @@ def main():
     ap.add_argument("--excel", default="", help="包含企业名称的 Excel 文件")
     ap.add_argument("--selftest", action="store_true",
                     help="只做环境自检（依赖/网络/翻译/可选官网可达性）后退出，不跑流水线")
+    ap.add_argument("--discover-only", dest="discover_only", action="store_true",
+                    help="两阶段流程第一阶段：只做官网发现，产出「官网候选复核表.xlsx」后退出")
+    ap.add_argument("--site-decisions", dest="site_decisions", default="",
+                    help="官网复核表（--discover-only 产出）：决定优先；未复核的中/低置信度默认跳过")
     ap.add_argument("--out", default="enterprise-site-output", help="本地输出目录")
     ap.add_argument("--en", default="", help="可选：已确认的英文 JSON")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 家，0=全部")
@@ -2387,13 +2569,15 @@ def main():
         raise SystemExit(f"找不到 Excel：{excel}")
     out = Path(args.out).expanduser().resolve()
     run_id = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    stage = out / "build" / run_id
-    stage.mkdir(parents=True, exist_ok=True)
     companies = load_excel(excel)
     if args.limit:
         companies = companies[:args.limit]
     if not companies:
         raise SystemExit("Excel 中没有可处理的企业名称")
+    if args.discover_only:
+        return run_discover_only(companies, args, out)
+    stage = out / "build" / run_id
+    stage.mkdir(parents=True, exist_ok=True)
     log(f"输入 {excel}")
     log(f"企业 {len(companies)} 家 · 本地输出 {out} · run_id {run_id}")
 
@@ -2418,14 +2602,40 @@ def main():
     for item in companies:
         item["resource_dir"] = str(resource_map.get(item["name"], "")) if resource_map else ""
 
-    archives = []
+    decisions = {}
+    if args.site_decisions:
+        decisions_path = Path(args.site_decisions).expanduser()
+        if not decisions_path.is_file():
+            raise SystemExit(f"找不到官网复核表：{decisions_path}")
+        decisions = load_site_decisions(decisions_path)
+        log(f"官网复核表 {decisions_path} · 读到 {len(decisions)} 家企业决定")
+
+    archives, skipped = [], []
     for i, item in enumerate(companies, 1):
+        plan = plan_site(item, decisions, args)
+        if plan["action"] == "skip":
+            skipped.append({"名称": item["name"], "原因": plan.get("reason", "")})
+            log(f"[{i}/{len(companies)}] {item['name']} —— 跳过：{plan.get('reason', '')}")
+            continue
+        item["_site_discovery"] = plan["discovery"]
         log(f"[{i}/{len(companies)}] {item['name']} ...")
         a = crawl_company(item, args, stage / "raw_home")
         if args.max_products:
             a["products"] = (a.get("products") or [])[:args.max_products]
         archives.append(a)
         log(f"  {a.get('status')} · 官网 {a.get('官网') or '未确认'} · 图片 {sum(len(a.get(k) or []) for k in IMAGE_DIRS)}")
+
+    if skipped:
+        write_json(stage / "官网复核结果.json", {
+            "处理企业数": len(archives), "跳过企业数": len(skipped), "跳过": skipped,
+        })
+        log(f"跳过 {len(skipped)} 家：{'、'.join(x['名称'] for x in skipped[:10])}"
+            f"{' 等' if len(skipped) > 10 else ''}"
+            f"（未复核的中/低置信度或复核选择跳过）；详见 {stage / '官网复核结果.json'}")
+    if not archives:
+        log("所有企业均被跳过。请先运行 --discover-only 生成复核表，"
+            "填写决定后再用 --site-decisions 重跑。")
+        return 1 if args.strict else 0
     en_data = load_en(args.en, archives, args, out / "_translate_cache.json")
     backlog = english_backlog(archives, en_data)
     backlog_path = ""

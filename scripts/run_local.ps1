@@ -7,6 +7,8 @@
     [string]$HtmlDir = "",          # Codex 内置浏览器保存的离线 HTML 目录（含 manifest.json）
     [string]$Resources = "",        # 用户资料总目录：每家一个任意命名子文件夹，或单家企业文件夹
     [string]$BackupDir = "",        # 原始资料备份目录（默认 <输出目录>\原始资料备份，在 deliverable 之外）
+    [string]$SiteDecisions = "",    # 官网候选复核表：决定优先；中/低置信度未复核默认跳过
+    [switch]$DiscoverOnly,          # 只做官网发现，产出「官网候选复核表.xlsx」后退出
     [switch]$AcceptNoEnglish,       # 用户明确接受中文版；英文相关门禁降为告警
     [int]$Limit = 0,
     [string]$TranslateEmail = "",
@@ -213,6 +215,11 @@ if ($Resources) {
     $runArgs += @("--resources", (Resolve-Path -LiteralPath $Resources).Path)
 }
 if ($BackupDir) { $runArgs += @("--backup-dir", [IO.Path]::GetFullPath($BackupDir)) }
+if ($SiteDecisions) {
+    if (-not (Test-Path -LiteralPath $SiteDecisions)) { throw "找不到官网复核表：$SiteDecisions" }
+    $runArgs += @("--site-decisions", (Resolve-Path -LiteralPath $SiteDecisions).Path)
+}
+if ($DiscoverOnly) { $runArgs += "--discover-only" }
 if ($Limit -gt 0) { $runArgs += @("--limit", [string]$Limit) }
 if ($TranslateEmail) { $runArgs += @("--translate-email", $TranslateEmail) }
 if ($NoTranslate) { $runArgs += "--no-translate" }
