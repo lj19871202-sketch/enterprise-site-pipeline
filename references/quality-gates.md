@@ -61,7 +61,7 @@ python "$SkillRoot\scripts\gates.py" `
 | `resource_intake` | warn | 用户资料摄入情况：`资料备注` 含"未归类/抽取失败"则告警（原件已备份，需人工确认）；`resource_only` 单列 | 告警，不阻断 |
 | `noise` | error | 中文或英文正文段不含导航/备案/联系方式/黄页词等噪声模式 | 命中 0 |
 | `summary` | error | 汇总表表头与行列数符合约定 | 表头精确匹配 |
-| `visual_review` | error/warn | 读取 `视觉核对.json`：官网抓取图必须逐张回写结论，并绑定当前图片 sha256 与 reviewed_at；用户资料图直通但“不符”仍 error；不支持类别继承。默认 error，只有显式 `--skip-visual-review` 才降 warn | 官网图未核对 0 条；不符 0 条；无 sha/reviewed_at 绑定 0 条 |
+| `visual_review` | error/warn | 读取 `视觉核对.json`：官网抓取图必须逐张回写结论，结论三档 `符合/不符/待核对`，只有 `符合` 放行（`待核对`/空均阻断），并绑定当前图片 sha256 与 reviewed_at；用户资料图直通但“不符”仍 error；不支持类别继承。默认 error，只有显式 `--skip-visual-review` 才降 warn | 官网图未核对 0 条；不符 0 条；待核对 0 条；无 sha/reviewed_at 绑定 0 条 |
 
 ## 关键门禁的意义
 
@@ -85,7 +85,7 @@ python "$SkillRoot\scripts\gates.py" `
 
 **`image_provenance`** —— 图片的 `from` 来源页必须与官网同域，防止把别家站点或聚合站的图当成企业自己的。聚合/黄页/工商/名录/B2B 站由 `scripts/domain_rules.py` 统一识别；来源页或图片直链命中目录站、或直链为外域时直接 error，不能靠视觉结论放行。用户资料图没有官网来源页，按资料优先跳过同域校验。
 
-**`visual_review`** —— 机器只能判“文件和引用对得上”，判不了“这张图到底是不是工厂/产品/logo/资质”。视觉核对由 Codex 自己打开拼版完成：把结论写进 `review\verdicts.json`，用 `visual_review.py --apply` 回写 `视觉核对.json`。默认 fail-closed：官网抓取图留空即 error；填“不符”直接 error；填“符合”才算完成。用户资料图按资料优先直通，不要求逐张结论，但显式“不符”仍阻断。结论只认逐张图，不支持类别继承；每张结论绑定 sha256 和 reviewed_at，图片变化后旧结论自动作废。只有用户明确接受风险时，`--skip-visual-review` 才把未核对降为 warn。
+**`visual_review`** —— 机器只能判“文件和引用对得上”，判不了“这张图到底是不是工厂/产品/logo/资质”。视觉核对由 Codex 自己打开拼版完成：先看核对表「锚点线索」，图片内容要能挂到本企业已证实的名称/产品/品类才判「符合」；把结论写进 `review\verdicts.json`（可用 `依据` 写清命中哪个锚点/来源），用 `visual_review.py --apply` 回写 `视觉核对.json`。默认 fail-closed：结论三档 `符合/不符/待核对`，只有 `符合` 放行；官网抓取图留空或填“待核对”即 error；填“不符”直接 error。用户资料图按资料优先直通，不要求逐张结论，但显式“不符”仍阻断。结论只认逐张图，不支持类别继承；每张结论绑定 sha256 和 reviewed_at，图片变化后旧结论自动作废。只有用户明确接受风险时，`--skip-visual-review` 才把未核对降为 warn。
 
 **`images` 的四类全空** —— 目录存在不等于有图。任何企业 `factory/product/logo/cert` 四类全空都直接报 error，必须补抓或在交付说明中标记 `empty_images`。
 
@@ -99,7 +99,7 @@ python "$SkillRoot\scripts\gates.py" `
 <run_id>/review/
 ├── 视觉核对图/<企业>/0.总览.png        # 四类速览
 ├── 视觉核对图/<企业>/<分类>.png         # 分类拼版（单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…）
-├── <企业>/图片核对表.xlsx              # 带缩略图；含结论下拉、SHA256、信任层级
+├── <企业>/图片核对表.xlsx              # 带缩略图；含锚点线索、结论下拉、SHA256、信任层级
 └── 核对指引.md                         # Codex 看图清单、判断口径和执行命令
 <run_id>/视觉核对.json                  # 结论载体，gates.py 读取
 ```
@@ -108,12 +108,12 @@ python "$SkillRoot\scripts\gates.py" `
 
 必须在短线程内完成：每批 ≤10 家，一个会话只做「查体积 → 看图 → 回写结论 → 跑门禁 → 发布」，做完即止；开工前跑 `scripts/session_guard.py`，本会话 rollout >20MB 先换会话。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以脚本把单页限制为 ≤12 张、≤1MB，图片多时按序号分页为 `<分类>_p1.png`、`<分类>_p2.png`……官网抓取图必须逐张看并逐张给结论；用户资料图标“信任层级=用户资料”，按资料优先直通，不要求逐张结论。
 
-1. 打开 `review/核对指引.md`，图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt/SHA256/信任层级）；
-2. 按指引标注的序号范围打开对应 `<分类>_pN.png` 放大确认；官网抓取图逐张判定，用户资料图可跳过未标记疑点。同时核对简介 docx 与产品清单内容；
+1. 打开 `review/核对指引.md`，图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt/锚点线索/SHA256/信任层级）；
+2. 按指引标注的序号范围打开对应 `<分类>_pN.png` 放大确认；官网抓取图逐张判定，判定时以「锚点线索」为参照，挂不上锚点的图不得判「符合」；用户资料图可跳过未标记疑点。同时核对简介 docx 与产品清单内容；
 3. 把结论写进 `review/verdicts.json`，只支持逐张图结论，不支持类别继承；然后执行 `visual_review.py --json "<run_id>/视觉核对.json" --apply "<run_id>/review/verdicts.json" --reviewer Codex` 回写；
 4. 执行 `gates.py` 复核（视觉默认强制）；全绿后用 `local_pipeline.py --publish-stage "<run_id>" --out "<输出目录>"` 发布，发布前会再跑一次门禁。
 
-**结论值**：`符合` / `不符` / `待核对`（空等同待核对）。重跑 `visual_review.py` 时，只有当旧结论记录的 sha256 与当前图片一致才保留；图片变化会清空结论并重新进入待核对。`--apply` 写入 reviewed_at，缺任一绑定都会在门禁报 error。
+**结论值**：`符合` / `不符` / `待核对`（空等同待核对，只有「符合」放行，「待核对」与留空同样阻断发布；可选 `依据` 字段写清命中哪个锚点/来源）。重跑 `visual_review.py` 时，只有当旧结论记录的 sha256 与当前图片一致才保留；图片变化会清空结论并重新进入待核对。`--apply` 写入 reviewed_at，缺任一绑定都会在门禁报 error。
 
 图片内容是否真属于该类、是否属于该企业，机器判不了，只能靠这一步；`visual_review` 只是把“官网图有没有逐张核对、结论是否仍对应当前文件”变成可断言状态。分级信任只减少用户资料图的机械核对，不降低官网抓取图的逐张要求。
 

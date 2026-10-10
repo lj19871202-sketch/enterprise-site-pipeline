@@ -148,7 +148,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 官网必须确认；中/低置信度未复核的企业在进入门禁前已默认跳过，若异常进入 `raw`/交付，`site_discovery` 直接报 error。官网未确认或不可访问但用户资料可用时，记 `resource_only`（仅凭用户资料成档），降为告警；
 - `resource_intake` 门禁检查用户资料摄入：未归类 / 抽取失败项会列出告警（原件已备份）；用户资料图跳过官网同域校验（`image_provenance`）；
 - 汇总表、档案、目录和英文集合必须一致；
-- 图片内容需视觉核对，结论写入 `视觉核对.json`：官网抓取图标“不符”或未回写均报 error，默认 fail-closed；只有显式 `--skip-visual-review` 才降为告警。用户资料图按资料优先直通，但显式“不符”仍报 error；结论只认逐张图并绑定 sha256 与 reviewed_at。
+- 图片内容需视觉核对，结论写入 `视觉核对.json`：结论三档 `符合/不符/待核对`，只有 `符合` 放行；官网抓取图标“不符”“待核对”或未回写均报 error，默认 fail-closed；只有显式 `--skip-visual-review` 才降为告警。用户资料图按资料优先直通，但显式“不符”仍报 error；结论只认逐张图并绑定 sha256 与 reviewed_at。判断以核对表「锚点线索」为参照，挂不上企业已证实锚点的图不得判「符合」。
 
 ## 视觉核对
 
@@ -157,11 +157,11 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 ```text
 build/<run_id>/review/视觉核对图/<企业>/0.总览.png    # 四类速览
 build/<run_id>/review/视觉核对图/<企业>/<分类>.png     # 分类拼版（单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…）
-build/<run_id>/review/<企业>/图片核对表.xlsx           # 带缩略图，结论列可下拉
+build/<run_id>/review/<企业>/图片核对表.xlsx           # 带缩略图、锚点线索，结论列可下拉
 build/<run_id>/视觉核对.json                           # 结论载体
 ```
 
-这一步由 Codex 自己做，不能把拼版甩给用户代看。开工前先跑 `python "$SkillRoot\scripts\session_guard.py"` 查本会话 rollout 体积，超过 20MB 先另开会话。然后读 `review/核对指引.md`：图片多时先用 `图片核对表.xlsx` 初筛，按指引标注的**序号范围**只打开可疑的 `<分类>_pN.png` 放大确认（同一分类被点名的页都要看）。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以必须短线程分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。结论写成 `verdicts.json` 后一键回写：
+这一步由 Codex 自己做，不能把拼版甩给用户代看。开工前先跑 `python "$SkillRoot\scripts\session_guard.py"` 查本会话 rollout 体积，超过 20MB 先另开会话。然后读 `review/核对指引.md`：图片多时先用 `图片核对表.xlsx` 初筛（含「锚点线索」列），按指引标注的**序号范围**只打开可疑的 `<分类>_pN.png` 放大确认（同一分类被点名的页都要看）。判断时以「锚点线索」为参照，图片内容能挂到本企业已证实的名称/产品/品类才判「符合」，挂不上又无法确认归属就判「待核对」。拼版图进入会话后是 base64，单张过大或累计过多会撑爆请求（历史故障：19 张拼版 28.8MB 触发上游报错），所以必须短线程分批：每批 ≤10 家，一个会话做完「看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话。结论写成 `verdicts.json` 后一键回写：
 
 ```powershell
 # 看图前先查会话体积（>20MB 先另开会话）
@@ -173,7 +173,7 @@ python "$SkillRoot\scripts\gates.py" --deliverable "<...>\deliverable" --raw "<.
   --en "<...>\en.json" --summary "<...>\汇总.xlsx" --visual "<...>\视觉核对.json" --require-visual
 ```
 
-结论只认逐张图，不支持类别继承；重跑时只有旧结论的 sha256 与当前图片一致才保留，图片变化会自动作废并重新进入待核对。`--apply` 会写入 reviewed_at。全部核对完成并通过门禁后，用 `local_pipeline.py --publish-stage "<...>\build\<run_id>" --out "<输出目录>"` 发布，发布前会再跑一次完整门禁。
+结论三档 `符合` / `不符` / `待核对`，只有 `符合` 放行，`待核对` 与留空一样阻断发布；可用 `依据` 字段写清命中哪个锚点/来源。结论只认逐张图，不支持类别继承；重跑时只有旧结论的 sha256 与当前图片一致才保留，图片变化会自动作废并重新进入待核对。`--apply` 会写入 reviewed_at。全部核对完成并通过门禁后，用 `local_pipeline.py --publish-stage "<...>\build\<run_id>" --out "<输出目录>"` 发布，发布前会再跑一次完整门禁。
 
 门禁红色先修数据或补抓，不要下调阈值迁就数据。
 

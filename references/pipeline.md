@@ -187,7 +187,7 @@ $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
 ```text
 <run_id>/review/视觉核对图/<企业>/0.总览.png
 <run_id>/review/视觉核对图/<企业>/<分类>.png    # 单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…
-<run_id>/review/<企业>/图片核对表.xlsx              # 含结论下拉、SHA256、信任层级
+<run_id>/review/<企业>/图片核对表.xlsx              # 含锚点线索、结论下拉、SHA256、信任层级
 <run_id>/review/核对指引.md
 <run_id>/视觉核对.json
 ```
@@ -197,11 +197,11 @@ $SkillRoot = "$env:USERPROFILE\.codex\skills\enterprise-site-pipeline"
 步骤：
 
 1. Codex 先跑 `scripts/session_guard.py` 查会话体积（>20MB 换会话），再打开 `review/核对指引.md`，按绝对路径逐家看图；
-2. 图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt/SHA256/信任层级），按指引的序号范围打开对应 `<分类>_pN.png`；官网抓取图逐张核对，用户资料图直通但“不符”仍阻断。同时核对简介 docx 和产品清单与原始页面是否一致；
+2. 图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt/锚点线索/SHA256/信任层级），按指引的序号范围打开对应 `<分类>_pN.png`；判定时以「锚点线索」为参照，图片内容挂不上本企业已证实锚点又无法确认归属的判「待核对」。官网抓取图逐张核对，用户资料图直通但“不符”仍阻断。同时核对简介 docx 和产品清单与原始页面是否一致；
 3. 把结论写进 `review/verdicts.json`，只支持逐张图结论，不支持类别继承；执行 `visual_review.py --json "<run_id>/视觉核对.json" --apply "<run_id>/review/verdicts.json" --reviewer Codex` 回写，脚本自动绑定当前 sha256 与 reviewed_at；
 4. 执行 `gates.py` 复核（视觉默认 fail-closed），全绿后用 `local_pipeline.py --publish-stage "<run_id>" --out "<输出目录>"` 发布；发布前会再跑一次完整门禁。
 
-结论只能写到单张图，不支持类别继承。重跑 `visual_review.py` 时只有旧结论的 sha256 与当前图片一致才会保留；图片变化会清空结论并重新进入待核对。
+结论只能写到单张图，不支持类别继承。结论三档 `符合` / `不符` / `待核对`，只有 `符合` 放行，`待核对` 与留空一样阻断发布；可用 `依据` 字段写清命中哪个锚点/来源。重跑 `visual_review.py` 时只有旧结论的 sha256 与当前图片一致才会保留；图片变化会清空结论并重新进入待核对。
 
 跳过生成用 `--no-visual-review`，但默认仍会被视觉门禁阻断；只有用户明确接受风险时才用 `--skip-visual-review` 降为告警。构建阶段可加 `local_pipeline.py --no-publish`，保证 Codex 先看图再发布。
 
@@ -230,7 +230,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 - 所有 error 项通过后，才把 stage 发布到输出目录 `deliverable/`；
 - 官网未发现时 `site_discovery` 为 error；中/低置信度未复核的官网若异常进入 raw/交付也会直接 error；正常情况下未复核企业在采集前已跳过；
-- `visual_review` 默认 fail-closed：官网抓取图标“不符”或未回写结论均 error；用户资料图直通但“不符”仍 error；只有显式 `--skip-visual-review` 才把未核对降为告警；
+- `visual_review` 默认 fail-closed：结论三档 `符合/不符/待核对`，只有 `符合` 放行；官网抓取图标“不符”“待核对”或未回写结论均 error；用户资料图直通但“不符”仍 error；只有显式 `--skip-visual-review` 才把未核对降为告警；
 - 自动翻译失败或英文缺失时 `en_entry`/`en_ascii`/`product_en`/`product_detail`/`product_map` 默认报红，并生成 `英文补译清单.json`；正常修复是用 `--en` 提供补译草稿或人工定稿后重跑；
 - 只有用户在当次对话中明确接受中文版时，才可加 `--accept-no-english` 将英文相关门禁降为告警；
 - 图片为空先补抓或在 Excel 补充官网，不修改门禁标准；
@@ -242,6 +242,6 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 2. `gates.json` 没有未解释的 error；
 3. `no_website`、`empty_images`、`partial` 清单可追溯；自动发现的官网置信度为高，或中/低已经填写复核表并明确“采用/自定义官网”；未复核项应出现在 `官网复核结果.json` 的跳过清单中；
 4. 默认交付必须英文完整：`英文补译清单.json` 无未处理项，英文是“已确认定稿”，或是已明确标注“自动翻译·待人工核校”的完整草稿；只有用户明确接受中文版时，才可保留 `accept_no_english` 的告警状态；
-5. 交付目录中的图片引用全部存在；官网抓取图已在 `视觉核对.json` 逐张标为“符合”且 sha256/reviewed_at 对应当前文件，用户资料图按分级信任直通但不存在“不符”；文档与产品清单也已标为“符合”；
+5. 交付目录中的图片引用全部存在；官网抓取图已在 `视觉核对.json` 逐张标为“符合”且 sha256/reviewed_at 对应当前文件，不得留“待核对”（与留空一样阻断发布）；用户资料图按分级信任直通但不存在“不符”；文档与产品清单也已标为“符合”；
 6. docx 中文段与 raw `intro_paragraphs`、产品清单行与 raw `products` 一致；
 7. 没有把密码、token 或 cookie 写入任何输出。

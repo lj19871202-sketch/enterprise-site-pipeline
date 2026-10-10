@@ -71,6 +71,68 @@ def sha256_file(path):
         return ""
 
 
+
+ANCHOR_STOP = {
+    "公司", "企业", "产品", "主要", "业务", "简介", "工厂", "车间",
+    "图片", "照片", "其他", "更多", "首页", "关于", "联系", "详情",
+}
+
+
+def clean_anchor(text):
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    s = re.sub(r"^[\-—·•\d]+[\.、,，:：]?\s*", "", s)
+    return s.strip(" .、,，;；")
+
+
+def clean_inline_anchor(text):
+    s = re.sub(r"[（(【\[].*?[）)】\]]", " ", str(text or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return clean_anchor(s)
+
+
+def anchor_tokens(archive):
+    """从企业档案抽取文字锚点：已证实的名称/产品/型号/品类等词。
+
+    用于看图判断时的参照——图片内容要能挂到这些词上才算贴合本企业，
+    挂不上就不该直接判符合。锚点只取结构化字段（名称/产品/品类），
+    不拆简介全文，避免把上游噪声带成假锚点。锚点是判断依据，不是自动结论。
+    """
+    name = clean_anchor(archive.get("名称"))
+    raw = []
+    for key in ("核心产品", "主要业务", "产业", "规模"):
+        raw.append(archive.get(key))
+    for prod in archive.get("products") or []:
+        raw.append(clean_inline_anchor(prod))
+    details = archive.get("product_details")
+    if isinstance(details, dict):
+        for key in details:
+            raw.append(clean_inline_anchor(key))
+    anchors, seen = [], set()
+    if name:
+        anchors.append(name)
+        seen.add(name)
+    for item in raw:
+        s = clean_inline_anchor(item)
+        if not s or len(s) < 2 or len(s) > 24 or s in ANCHOR_STOP or s in seen:
+            continue
+        seen.add(s)
+        anchors.append(s)
+        if len(anchors) >= 24:
+            break
+    return anchors
+
+
+def match_anchors(*texts, anchors):
+    """在图名/alt/URL 里找出能挂靠的文字锚点，作为判断线索。"""
+    blob = " ".join(str(t or "") for t in texts).lower()
+    hit = []
+    for a in anchors or []:
+        key = a.lower().strip()
+        if len(key) >= 2 and key in blob and a not in hit:
+            hit.append(a)
+    return hit
+
+
 def company_dir_name(name):
     """与 local_pipeline.safe_filename 保持一致。"""
     s = re.sub(r"\s+", " ", str(name or "")).strip()
@@ -280,23 +342,27 @@ def build_montage(records, out_path, title, subtitle,
 def company_records(deliverable, name, archive):
     out = {}
     home = deliverable / company_dir_name(name)
+    company_anchors = anchor_tokens(archive)
     for cat, folder in DIRS.items():
         items = []
         for i, it in enumerate(archive.get(cat) or [], 1):
             filename = str(it.get("file", ""))
             path = home / folder / filename
+            alt = str(it.get("alt", ""))
             items.append({
                 "idx": i,
                 "folder": folder,
                 "file": filename,
                 "path": path,
-                "alt": str(it.get("alt", "")),
+                "alt": alt,
                 "url": str(it.get("url", "")),
                 "from": str(it.get("from", "")),
                 "wh": str(it.get("wh", "")),
                 "source": str(it.get("source", "")),
                 "trust": "用户资料" if str(it.get("source", "")) == "用户资料" else "官网",
                 "sha256": sha256_file(path),
+                "anchors": company_anchors,
+                "candidate_anchors": match_anchors(alt, filename, str(it.get("url", "")), anchors=company_anchors),
             })
         out[folder] = items
     return out
@@ -311,7 +377,7 @@ def make_review_xlsx(path, records_by_cat):
     ws = wb.active
     ws.title = "图片核对"
     headers = ["分类", "序号", "文件", "缩略图", "尺寸", "图片URL", "来源页面", "alt",
-               "结论", "说明", "SHA256", "信任层级"]
+               "锚点线索", "结论", "说明", "SHA256", "信任层级"]
     ws.append(headers)
     for c in range(1, len(headers) + 1):
         ws.cell(row=1, column=c).font = Font(bold=True)
@@ -328,8 +394,9 @@ def make_review_xlsx(path, records_by_cat):
                 ws.cell(row=row, column=6, value=rec["url"])
                 ws.cell(row=row, column=7, value=rec["from"])
                 ws.cell(row=row, column=8, value=rec["alt"])
-                ws.cell(row=row, column=11, value=rec["sha256"])
-                ws.cell(row=row, column=12, value=rec.get("trust", "官网"))
+                ws.cell(row=row, column=9, value="、".join(rec.get("candidate_anchors") or []))
+                ws.cell(row=row, column=12, value=rec["sha256"])
+                ws.cell(row=row, column=13, value=rec.get("trust", "官网"))
                 ws.row_dimensions[row].height = 92
                 im = load_thumb(rec["path"], (120, 120))
                 if im is not None:
@@ -345,9 +412,9 @@ def make_review_xlsx(path, records_by_cat):
         last = max(2, row - 1)
         dv = DataValidation(type="list", formula1='"符合,不符,待核对"', allow_blank=True)
         ws.add_data_validation(dv)
-        dv.add(f"I2:I{last}")
+        dv.add(f"J2:J{last}")
         widths = {"A": 16, "B": 6, "C": 26, "D": 18, "E": 10, "F": 40,
-                  "G": 40, "H": 24, "I": 10, "J": 30, "K": 68, "L": 12}
+                  "G": 40, "H": 24, "I": 26, "J": 10, "K": 30, "L": 68, "M": 12}
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
         ws.freeze_panes = "A2"
@@ -392,8 +459,10 @@ def build_template(companies_records, existing, montage_hashes=None):
                 imgs[key] = {
                     "结论": pi.get("结论", "") if keep else "",
                     "说明": pi.get("说明", "") if keep else "",
+                    "依据": pi.get("依据", "") if keep else "",
                     "trust": rec.get("trust", "官网"),
                     "必核": rec.get("trust", "官网") != "用户资料",
+                    "候选锚点": rec.get("candidate_anchors") or [],
                     "sha256": current_sha,
                     "reviewed_at": pi.get("reviewed_at", "") if keep else "",
                 }
@@ -405,11 +474,21 @@ def build_template(companies_records, existing, montage_hashes=None):
             "产品清单": {"结论": prod.get("结论", ""), "说明": prod.get("说明", "")},
         }
     prev_info = existing.get("_核对信息") if isinstance(existing.get("_核对信息"), dict) else {}
+    anchor_map = {}
+    for name, records_by_cat in companies_records.items():
+        for items in records_by_cat.values():
+            for rec in items:
+                if rec.get("anchors"):
+                    anchor_map[name] = rec["anchors"]
+                    break
+            if name in anchor_map:
+                break
     out["_核对信息"] = {
         "核对人": prev_info.get("核对人", ""),
         "核对时间": prev_info.get("核对时间", ""),
         "写入条数": prev_info.get("写入条数", 0),
         "拼版哈希": montage_hashes or {},
+        "文字锚点": anchor_map,
     }
     return out
 
@@ -443,7 +522,7 @@ def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
                 if isinstance(val, str):
                     val = {"结论": val}
                 if isinstance(val, dict):
-                    clean = {k: v for k, v in val.items() if k in ("结论", "说明")}
+                    clean = {k: v for k, v in val.items() if k in ("结论", "说明", "依据")}
                     if clean:
                         item = target.get(key)
                         if not isinstance(item, dict):
@@ -473,11 +552,13 @@ def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
                     applied += 1
     if errors:
         raise SystemExit("视觉结论未写入，请修正后重试：\n- " + "\n- ".join(errors[:20]))
+    prev_info = data.get("_核对信息") if isinstance(data.get("_核对信息"), dict) else {}
     data["_核对信息"] = {
         "核对人": reviewer,
         "核对时间": now,
         "写入条数": applied,
-        "拼版哈希": (data.get("_核对信息") or {}).get("拼版哈希", {}),
+        "拼版哈希": prev_info.get("拼版哈希", {}),
+        "文字锚点": prev_info.get("文字锚点", {}),
     }
     write_json(json_path, data)
     return applied
@@ -501,7 +582,7 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_ma
         "",
         "## 大批量初筛（图片多时优先）",
         "",
-        "- 图片多的企业先用同目录的 `图片核对表.xlsx` 初筛：每行一张图，对着 分类/序号/尺寸/图片URL/来源页面/alt 找可疑项。",
+        "- 图片多的企业先用同目录的 `图片核对表.xlsx` 初筛：每行一张图，对着 分类/序号/尺寸/图片URL/来源页面/alt/锚点线索 找可疑项。",
         "- 用下面的「序号范围」定位可疑序号所在的拼版页，只打开这些页做放大确认；每张图片都必须有独立结论，不能用类别结论代替。",
         "- 初筛只是先导，不能代替结论：初筛点名的行必须逐张给出结论，`视觉核对.json` 里不能留下未填的「待核对」。",
         "",
@@ -543,21 +624,27 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_ma
         "",
         "## 判断口径",
         "",
+        "三档结论：`符合` / `不符` / `待核对`。只有 `符合` 才能过门禁；`待核对` 与留空一样阻断发布，不是放行。",
+        "判断时先看核对表的「锚点线索」：图片内容要能挂到本企业已证实的名称/产品/型号/品类上，才判「符合」；",
+        "挂不上任何锚点又无法确认归属的，判「待核对」，不要硬判「符合」。",
+        "",
         "- 企业logo：是否为该企业标识；不是则「不符」。",
         "- 企业工厂图：是否为厂区、车间、产线、办公/园区实景；不是则「不符」。",
-        "- 企业产品图：是否为该企业产品；错图、宣传海报、无关配图则「不符」。",
+        "- 企业产品图：是否为该企业产品；错图、宣传海报、无关配图、图库素材则「不符」。",
         "- 资质证书：是否为该企业资质/证书；模糊到不可辨认或有其他企业名称则「不符」。",
         "- 文档与产品清单：docx 是否中英双语且无乱码；产品清单行是否为真实产品、图片与产品是否对应。",
         "- 同一张图跨类别重复且语义不符，判「不符」并在说明里写明。",
+        "- 拿不准时用「待核对」，并在说明里写清卡在哪一步（分辨率、归属、来源）；不要为了过门禁硬填「符合」。",
         "",
         "## 回写格式",
         "",
-        "把结论写成 verdicts.json（简写也可）：",
+        "把结论写成 verdicts.json（简写也可）；`依据` 写清命中哪个锚点或来源，便于事后复核：",
         "",
         "```json",
         "{",
         '  "企业全称": {',
-        '    "图片": {"3.企业logo/01_xxx.png": {"结论": "符合", "说明": ""}},',
+        '    "图片": {"3.企业logo/01_xxx.png": {"结论": "符合", "说明": "", "依据": "锚点：企业名"}},',
+        '    "图片待核对示例": {"2.企业产品图/02_xxx.jpg": {"结论": "待核对", "说明": "图库素材疑似，无法确认归属"}},',
         '    "文档": {"结论": "符合"},',
         '    "产品清单": {"结论": "符合"}',
         "  }",
@@ -571,7 +658,7 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_ma
         gates_cmd,
         "```",
         "",
-        "任一条「不符」都必须先修数据或补抓再重跑；不要把「不符」改成「待核对」绕过门禁。",
+        "任一条「不符」都必须先修数据或补抓再重跑；「待核对」同样阻断发布，拿不准就如实标注并说明原因，不要用「符合」蒙混过关。",
         "",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -633,10 +720,15 @@ def main():
             counts[(name, folder)] = len(items)
             flat += items
             if items:
+                hint = " / ".join((items[0].get("anchors") or [])[:6])
+                subtitle = (f"{LABELS.get(folder, '')} · {len(items)} 张 · "
+                            f"Codex 逐张确认是否属于本企业与本分类")
+                if hint:
+                    subtitle += f" · 锚点参照：{hint}"
                 pages_map[(name, folder)] = build_montage(
                     items, base / f"{folder}.png",
                     f"{name} · {folder}",
-                    f"{LABELS.get(folder, '')} · {len(items)} 张 · Codex 逐张确认是否属于本企业与本分类",
+                    subtitle,
                 )
         if flat:
             picks = []
@@ -659,7 +751,9 @@ def main():
             montage_hashes[str(fp.relative_to(review)).replace("\\", "/")] = sha256_file(fp)
     template = build_template(records_map, existing, montage_hashes)
     write_json(json_path, {
-        "_说明": "结论可填 符合/不符/待核对。Codex 必须打开拼版逐张看图后回写；每张图片必须有独立结论，不支持类别级继承。",
+        "_说明": ("结论三档：符合/不符/待核对（空等同待核对，只有 符合 放行）。"
+                 "每张图带 候选锚点 供挂靠参照，并可用 依据 字段写清命中哪个锚点/来源。"
+                 "Codex 必须逐张看图后回写，不支持类别级继承。"),
         **template,
     })
 
