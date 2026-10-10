@@ -17,7 +17,8 @@
     [switch]$Playwright,            # 强制 JS 渲染（等价 --playwright on）
     [switch]$NoPlaywright,          # 关闭 JS 渲染（等价 --playwright off）
     [switch]$NoPlaywrightInstall,   # 只检测，不自动安装 Playwright/Chromium
-    [switch]$RequireVisual,         # 视觉核对未完成按 error 处理
+    [switch]$RequireVisual,         # 兼容旧参数；视觉核对默认已强制
+    [switch]$SkipVisualReview,      # 显式跳过视觉核对门禁（仅调试/用户明确授权）
     [switch]$NoPublish,             # 先只构建，Codex 核对后再 --publish-stage
     [int]$PlaywrightInstallTimeoutSec = 600,  # 单次 Playwright/Chromium 安装超时（秒）
     [switch]$NoBootstrap,          # 缺核心依赖时不自动创建 .venv
@@ -225,7 +226,12 @@ if ($TranslateEmail) { $runArgs += @("--translate-email", $TranslateEmail) }
 if ($NoTranslate) { $runArgs += "--no-translate" }
 if ($AcceptNoEnglish) { $runArgs += "--accept-no-english" }
 if ($NoVisualReview) { $runArgs += "--no-visual-review" }
-if ($RequireVisual) { $runArgs += "--require-visual" }
+if ($SkipVisualReview) {
+    Write-Host "警告：已显式跳过视觉核对门禁，仅用于调试或用户明确授权。" -ForegroundColor Yellow
+    $runArgs += "--skip-visual-review"
+} elseif ($RequireVisual) {
+    $runArgs += "--require-visual"
+}
 if ($NoPublish) { $runArgs += "--no-publish" }
 if (-not $AllowRed) { $runArgs += "--strict" }
 

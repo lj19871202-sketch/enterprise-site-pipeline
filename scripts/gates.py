@@ -20,6 +20,8 @@ import os
 import re
 import sys
 
+from domain_rules import is_directory_host
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -82,6 +84,17 @@ def same_host(a, b):
 
 def norm_text(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+def file_sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 def company_dir_name(name):
@@ -169,6 +182,8 @@ def gate_site_discovery(ctx):
                 res_only.append(f"{name}: 无官网，基于用户资料成档")
             else:
                 bad.append(f"{name}: 未发现官网")
+        elif is_directory_host(site):
+            bad.append(f"{name}: 官网为目录/聚合站，不能作为企业官网 {site}")
         elif conf.startswith("中") or conf.startswith("低") or "需复核" in conf:
             review.append(f"{name}: 官网置信度{conf or '未知'}，未复核不得采集 {site}")
     if bad or review:
@@ -327,14 +342,18 @@ def gate_image_provenance(ctx):
                 fh = host_of(frm)
                 if not frm:
                     bad.append(f"{label}: 缺来源页面")
+                elif is_directory_host(frm):
+                    bad.append(f"{label}: 来源页为目录/聚合站 {fh}")
                 elif not same_host(fh, site_host):
                     bad.append(f"{label}: 来源页域名 {fh or frm[:40]} 与官网不一致")
                 uh = host_of(it.get("url", ""))
-                if uh and site_host and not same_host(uh, site_host):
-                    offsite.append(f"{label}: 图片直链 {uh}")
-    detail = (f"来源页非官网 {len(bad)} 条；图片直链外域 {len(offsite)} 条（CDN 需人工确认）；"
+                if is_directory_host(it.get("url", "")):
+                    offsite.append(f"{label}: 图片直链为目录/聚合站 {uh}")
+                elif uh and site_host and not same_host(uh, site_host):
+                    offsite.append(f"{label}: 图片直链外域 {uh}，按分层信任规则丢弃")
+    detail = (f"来源页非官网/缺源 {len(bad)} 条；图片直链外域/聚合站 {len(offsite)} 条；"
               f"用户资料图 {len(user_src)} 条（按资料优先通过）")
-    return Gate("image_provenance", "error", not bad, detail, bad + offsite)
+    return Gate("image_provenance", "error", not bad and not offsite, detail, bad + offsite)
 
 
 def english_gate_level(ctx):
@@ -628,21 +647,37 @@ def gate_visual_review(ctx):
         data = read_json(path)
     except Exception as exc:
         return Gate("visual_review", "error", False, f"视觉核对文件无法解析：{exc}")
-    bad, pending = [], []
+    bad, pending, user_pass = [], [], []
     for name, d in sorted(ctx["companies"].items()):
         entry = data.get(name) if isinstance(data.get(name), dict) else {}
         if not entry:
             pending.append(f"{name}: 未核对")
             continue
-        cats = entry.get("类别") if isinstance(entry.get("类别"), dict) else {}
         imgs = entry.get("图片") if isinstance(entry.get("图片"), dict) else {}
         for cat, folder in DIRS2.items():
             for it in d.get(cat) or []:
                 key = f"{folder}/{it.get('file', '')}"
                 per_image = imgs.get(key) if isinstance(imgs.get(key), dict) else {}
+                trust = str(per_image.get("trust") or "").strip()
+                if not trust:
+                    trust = "用户资料" if str(it.get("source") or "") == "用户资料" else "官网"
+                if trust == "用户资料":
+                    kind = verdict_kind(per_image.get("结论")) if per_image else "pending"
+                    if kind == "bad":
+                        bad.append(f"{name} {key}: 用户资料图视觉核对不符（需先处理）")
+                    else:
+                        user_pass.append(f"{name} {key}")
+                    continue
+                actual_sha = file_sha256(os.path.join(company_path(ctx["deliverable"], name),
+                                                       folder, it.get("file", "")))
+                bound_sha = str(per_image.get("sha256") or "")
+                if not bound_sha or not actual_sha or bound_sha != actual_sha:
+                    pending.append(f"{name} {key}: 结论未绑定当前图片 sha256（需重新看图）")
+                    continue
+                if not str(per_image.get("reviewed_at") or "").strip():
+                    pending.append(f"{name} {key}: 缺少 reviewed_at，需重新看图")
+                    continue
                 kind = verdict_kind(per_image.get("结论"))
-                if kind == "pending":
-                    kind = verdict_kind((cats.get(folder) or {}).get("结论"))
                 if kind == "bad":
                     bad.append(f"{name} {key}: 视觉核对不符")
                 elif kind == "pending":
@@ -656,11 +691,16 @@ def gate_visual_review(ctx):
                 pending.append(f"{name} {field}: 待核对")
     if bad:
         return Gate("visual_review", "error", False,
-                    f"{len(bad)} 条视觉核对不符、{len(pending)} 条待核对", bad + pending)
+                    f"{len(bad)} 条视觉核对不符、{len(pending)} 条待核对、"
+                    f"{len(user_pass)} 张用户资料图按分层信任直通", bad + pending)
     if pending:
         level = "error" if ctx.get("require_visual") else "warn"
-        return Gate("visual_review", level, False, f"{len(pending)} 条待 Codex 看图核对（未回写结论）", pending)
-    return Gate("visual_review", "warn", True, f"{len(ctx['companies'])} 家视觉核对完成")
+        return Gate("visual_review", level, False,
+                    f"{len(pending)} 条官网抓取图待 Codex 看图核对（未回写结论）；"
+                    f"用户资料图 {len(user_pass)} 张直通", pending)
+    return Gate("visual_review", "warn", True,
+                f"{len(ctx['companies'])} 家视觉核对完成；"
+                f"用户资料图 {len(user_pass)} 张按分层信任直通")
 
 
 def gate_resource_intake(ctx):
@@ -741,7 +781,10 @@ def main():
     ap.add_argument("--en", default="", help="定稿英文 json")
     ap.add_argument("--summary", default="", help="汇总 xlsx")
     ap.add_argument("--visual", default="", help="视觉核对.json，默认取 deliverable 同级")
-    ap.add_argument("--require-visual", action="store_true", help="视觉核对未完成按 error 处理")
+    ap.add_argument("--require-visual", action="store_true",
+                    help="兼容旧参数；视觉核对默认已强制，未完成按 error 处理")
+    ap.add_argument("--skip-visual-review", action="store_true",
+                    help="显式跳过视觉核对门禁（仅调试/用户明确授权时使用）")
     ap.add_argument("--accept-no-english", action="store_true",
                     help="用户明确接受中文版；英文缺失降为告警")
     ap.add_argument("--expected", type=int, default=0, help="期望企业数，0=不校验")
@@ -779,7 +822,7 @@ def main():
         "en_path": pick("en_final", a.en),
         "summary": pick("summary", a.summary),
         "visual": visual_path,
-        "require_visual": bool(a.require_visual or cfg.get("require_visual")),
+        "require_visual": not bool(a.skip_visual_review or cfg.get("skip_visual_review")),
         "accept_no_english": bool(a.accept_no_english or cfg.get("accept_no_english")),
         "expected": a.expected or int(cfg.get("expected_companies") or 0),
         "ascii_max": (a.ascii_max if a.ascii_max is not None

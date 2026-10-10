@@ -14,6 +14,7 @@ Codex 执行时用图像查看工具打开拼版，把结论写回 视觉核对.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,18 @@ def read_json(path):
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def sha256_file(path):
+    """图片/拼版内容指纹；文件不存在或读取失败时返回空串。"""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 def company_dir_name(name):
@@ -271,15 +284,19 @@ def company_records(deliverable, name, archive):
         items = []
         for i, it in enumerate(archive.get(cat) or [], 1):
             filename = str(it.get("file", ""))
+            path = home / folder / filename
             items.append({
                 "idx": i,
                 "folder": folder,
                 "file": filename,
-                "path": home / folder / filename,
+                "path": path,
                 "alt": str(it.get("alt", "")),
                 "url": str(it.get("url", "")),
                 "from": str(it.get("from", "")),
                 "wh": str(it.get("wh", "")),
+                "source": str(it.get("source", "")),
+                "trust": "用户资料" if str(it.get("source", "")) == "用户资料" else "官网",
+                "sha256": sha256_file(path),
             })
         out[folder] = items
     return out
@@ -293,7 +310,8 @@ def make_review_xlsx(path, records_by_cat):
     wb = Workbook()
     ws = wb.active
     ws.title = "图片核对"
-    headers = ["分类", "序号", "文件", "缩略图", "尺寸", "图片URL", "来源页面", "alt", "结论", "说明"]
+    headers = ["分类", "序号", "文件", "缩略图", "尺寸", "图片URL", "来源页面", "alt",
+               "结论", "说明", "SHA256", "信任层级"]
     ws.append(headers)
     for c in range(1, len(headers) + 1):
         ws.cell(row=1, column=c).font = Font(bold=True)
@@ -310,6 +328,8 @@ def make_review_xlsx(path, records_by_cat):
                 ws.cell(row=row, column=6, value=rec["url"])
                 ws.cell(row=row, column=7, value=rec["from"])
                 ws.cell(row=row, column=8, value=rec["alt"])
+                ws.cell(row=row, column=11, value=rec["sha256"])
+                ws.cell(row=row, column=12, value=rec.get("trust", "官网"))
                 ws.row_dimensions[row].height = 92
                 im = load_thumb(rec["path"], (120, 120))
                 if im is not None:
@@ -326,7 +346,8 @@ def make_review_xlsx(path, records_by_cat):
         dv = DataValidation(type="list", formula1='"符合,不符,待核对"', allow_blank=True)
         ws.add_data_validation(dv)
         dv.add(f"I2:I{last}")
-        widths = {"A": 16, "B": 6, "C": 26, "D": 18, "E": 10, "F": 40, "G": 40, "H": 24, "I": 10, "J": 30}
+        widths = {"A": 16, "B": 6, "C": 26, "D": 18, "E": 10, "F": 40,
+                  "G": 40, "H": 24, "I": 10, "J": 30, "K": 68, "L": 12}
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
         ws.freeze_panes = "A2"
@@ -356,36 +377,48 @@ def make_review_xlsx(path, records_by_cat):
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
-def build_template(companies_records, existing):
+def build_template(companies_records, existing, montage_hashes=None):
     out = {}
     for name, records_by_cat in companies_records.items():
         prev = existing.get(name) if isinstance(existing.get(name), dict) else {}
-        prev_cats = prev.get("类别") if isinstance(prev.get("类别"), dict) else {}
         prev_imgs = prev.get("图片") if isinstance(prev.get("图片"), dict) else {}
-        cats, imgs = {}, {}
+        imgs = {}
         for folder, items in records_by_cat.items():
-            pc = prev_cats.get(folder) if isinstance(prev_cats.get(folder), dict) else {}
-            cats[folder] = {"结论": pc.get("结论", ""), "说明": pc.get("说明", "")}
             for rec in items:
                 key = f"{folder}/{rec['file']}"
                 pi = prev_imgs.get(key) if isinstance(prev_imgs.get(key), dict) else {}
-                imgs[key] = {"结论": pi.get("结论", ""), "说明": pi.get("说明", "")}
+                current_sha = rec.get("sha256", "")
+                keep = bool(current_sha and pi.get("sha256") == current_sha)
+                imgs[key] = {
+                    "结论": pi.get("结论", "") if keep else "",
+                    "说明": pi.get("说明", "") if keep else "",
+                    "trust": rec.get("trust", "官网"),
+                    "必核": rec.get("trust", "官网") != "用户资料",
+                    "sha256": current_sha,
+                    "reviewed_at": pi.get("reviewed_at", "") if keep else "",
+                }
         doc = prev.get("文档") if isinstance(prev.get("文档"), dict) else {}
         prod = prev.get("产品清单") if isinstance(prev.get("产品清单"), dict) else {}
         out[name] = {
-            "类别": cats,
             "图片": imgs,
             "文档": {"结论": doc.get("结论", ""), "说明": doc.get("说明", "")},
             "产品清单": {"结论": prod.get("结论", ""), "说明": prod.get("说明", "")},
         }
+    prev_info = existing.get("_核对信息") if isinstance(existing.get("_核对信息"), dict) else {}
+    out["_核对信息"] = {
+        "核对人": prev_info.get("核对人", ""),
+        "核对时间": prev_info.get("核对时间", ""),
+        "写入条数": prev_info.get("写入条数", 0),
+        "拼版哈希": montage_hashes or {},
+    }
     return out
 
 
 def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
     """把 Codex（或人工）看图后给出的结论合并进 视觉核对.json。
 
-    verdicts.json 既可写成 {"企业名": {"类别": {...}, "图片": {...}}}，
-    也可写成 {"核对": {...}}。类别/图片条目支持简写 "符合"。
+    verdicts.json 既可写成 {"企业名": {"图片": {...}}}，
+    也可写成 {"核对": {...}}。图片条目支持简写 "符合"。
     """
     if not verdicts_path.is_file():
         raise SystemExit(f"找不到核对结论文件：{verdicts_path}")
@@ -394,7 +427,9 @@ def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
     if isinstance(payload, dict) and isinstance(payload.get("核对"), dict):
         payload = payload["核对"]
     applied = 0
-    sections = ("类别", "图片")
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    errors = []
+    sections = ("图片",)
     for name, entry in payload.items():
         if name.startswith("_") or not isinstance(entry, dict):
             continue
@@ -410,7 +445,20 @@ def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
                 if isinstance(val, dict):
                     clean = {k: v for k, v in val.items() if k in ("结论", "说明")}
                     if clean:
-                        target.setdefault(key, {}).update(clean)
+                        item = target.get(key)
+                        if not isinstance(item, dict):
+                            errors.append(f"{name} {key}: 当前图片清单中不存在该键")
+                            continue
+                        expected_sha = str(item.get("sha256") or "")
+                        if not expected_sha:
+                            errors.append(f"{name} {key}: 当前图片缺少 sha256，先重跑 visual_review.py")
+                            continue
+                        if val.get("sha256") and str(val.get("sha256")) != expected_sha:
+                            errors.append(f"{name} {key}: 提交的 sha256 与当前图片不一致")
+                            continue
+                        item.update(clean)
+                        item["sha256"] = expected_sha
+                        item["reviewed_at"] = now
                         applied += 1
         for field in ("文档", "产品清单"):
             val = entry.get(field)
@@ -419,12 +467,17 @@ def apply_verdicts(json_path, verdicts_path, reviewer="Codex"):
             if isinstance(val, dict):
                 clean = {k: v for k, v in val.items() if k in ("结论", "说明")}
                 if clean:
-                    dst.setdefault(field, {}).update(clean)
+                    item = dst.setdefault(field, {})
+                    item.update(clean)
+                    item["reviewed_at"] = now
                     applied += 1
+    if errors:
+        raise SystemExit("视觉结论未写入，请修正后重试：\n- " + "\n- ".join(errors[:20]))
     data["_核对信息"] = {
         "核对人": reviewer,
-        "核对时间": datetime.datetime.now().isoformat(timespec="seconds"),
+        "核对时间": now,
         "写入条数": applied,
+        "拼版哈希": (data.get("_核对信息") or {}).get("拼版哈希", {}),
     }
     write_json(json_path, data)
     return applied
@@ -449,7 +502,7 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_ma
         "## 大批量初筛（图片多时优先）",
         "",
         "- 图片多的企业先用同目录的 `图片核对表.xlsx` 初筛：每行一张图，对着 分类/序号/尺寸/图片URL/来源页面/alt 找可疑项。",
-        "- 用下面的「序号范围」定位可疑序号所在的拼版页，只打开这些页做放大确认；整类看不出疑点的可直接给类别结论。",
+        "- 用下面的「序号范围」定位可疑序号所在的拼版页，只打开这些页做放大确认；每张图片都必须有独立结论，不能用类别结论代替。",
         "- 初筛只是先导，不能代替结论：初筛点名的行必须逐张给出结论，`视觉核对.json` 里不能留下未填的「待核对」。",
         "",
         "## 每家企业",
@@ -466,19 +519,27 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_ma
             if not items:
                 continue
             pages = pages_map.get((name, folder)) or []
+            user_n = sum(1 for rec in items if rec.get("trust") == "用户资料")
+            site_n = len(items) - user_n
+            trust_note = f"官网必核 {site_n} 张" + (
+                f"；用户资料直通 {user_n} 张" if user_n else "")
             if pages:
-                lines.append(f"- {folder}（{len(items)} 张，{len(pages)} 页）：")
+                lines.append(f"- {folder}（{len(items)} 张，{len(pages)} 页；{trust_note}）：")
                 for page in pages:
                     span = (str(page["first"]) if page["first"] == page["last"]
                             else f"{page['first']}-{page['last']}")
                     lines.append(f"    - 序号 {span}（{page['count']} 张）：`{page['path']}`")
             else:
-                lines.append(f"- {folder}（{len(items)} 张）：`{base / (folder + '.png')}`")
+                lines.append(f"- {folder}（{len(items)} 张；{trust_note}）：`{base / (folder + '.png')}`")
         lines.append("")
     lines += [
         "## 看图范围",
         "",
-        "- 分类拼版单页最多 12 张、≤1MB；图片多时写成 `<分类>_p1.png`、`<分类>_p2.png`……按序号分页。初筛点名的页必须逐页打开；整类无疑点时可直接给类别结论。",
+        "- 分类拼版单页最多 12 张、≤1MB；图片多时写成 `<分类>_p1.png`、`<分类>_p2.png`……按序号分页。初筛点名的页必须逐页打开；每张图片都必须逐张给出结论，不支持类别级继承。",
+        "- 分级信任：官网抓取图（核对表「信任层级=官网」）必须逐张看图并回写结论，未回写会阻断发布。",
+        "- 分级信任：用户资料图（核对表「信任层级=用户资料」）按资料优先直通，不要求逐张结论；但一旦标「不符」仍会阻断，需先处理。",
+        "- 外域/聚合站图片由 `image_provenance` 门禁判红，不进入强制核对面；处理方式是删除该图并重抓，不要靠视觉结论放行。",
+        "- `视觉核对.json` 中每张图片都带 `sha256`；回写时由 `--apply` 自动绑定当前文件指纹和 `reviewed_at`，不要手改。图片变化后旧结论会自动作废。",
         "",
         "## 判断口径",
         "",
@@ -496,7 +557,6 @@ def write_review_guide(path, records_map, review, json_path, gates_cmd, pages_ma
         "```json",
         "{",
         '  "企业全称": {',
-        '    "类别": {"1.企业工厂图": {"结论": "符合", "说明": "厂区/车间实景"}, "2.企业产品图": {"结论": "符合"}},',
         '    "图片": {"3.企业logo/01_xxx.png": {"结论": "符合", "说明": ""}},',
         '    "文档": {"结论": "符合"},',
         '    "产品清单": {"结论": "符合"}',
@@ -592,9 +652,14 @@ def main():
             )
         make_review_xlsx(review / company_dir_name(name) / "图片核对表.xlsx", records_by_cat)
 
-    template = build_template(records_map, existing)
+    montage_hashes = {}
+    montage_root = review / "视觉核对图"
+    if montage_root.is_dir():
+        for fp in sorted(montage_root.rglob("*.png")):
+            montage_hashes[str(fp.relative_to(review)).replace("\\", "/")] = sha256_file(fp)
+    template = build_template(records_map, existing, montage_hashes)
     write_json(json_path, {
-        "_说明": "结论可填 符合/不符/待核对。Codex 必须打开拼版逐张看图后回写；类别结论非空时，该类未单独填写的图片继承类别结论。",
+        "_说明": "结论可填 符合/不符/待核对。Codex 必须打开拼版逐张看图后回写；每张图片必须有独立结论，不支持类别级继承。",
         **template,
     })
 

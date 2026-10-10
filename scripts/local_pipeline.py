@@ -30,6 +30,8 @@ import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 
+from domain_rules import is_directory_host, registrable
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -99,32 +101,16 @@ JUNK_DOMAIN = re.compile(
     r"^[a-z0-9]\.(?:top|com|cn|net|org|info|biz)$",
     re.I,
 )
-MULTI_TLD = ("com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn")
-
-
-def registrable(host):
-    """取可注册域名，用于去重（www.injet.cn 与 injet.cn 同一个）。"""
-    host = (host or "").lower().strip(".")
-    if not host:
-        return ""
-    parts = host.split(".")
-    if len(parts) >= 3 and ".".join(parts[-2:]) in MULTI_TLD:
-        return ".".join(parts[-3:])
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return host
-
-
 def harvest_domains(html):
     """从搜索结果 HTML 里挖出候选域名及出现次数。"""
     counts = collections.Counter()
     for m in DOMAIN_RE.finditer(html or ""):
         d = m.group(1).lower().strip(".")
         sld = d.split(".")[0]
-        if len(sld) < 3 or JUNK_DOMAIN.search(d):
+        if len(sld) < 3 or JUNK_DOMAIN.search(d) or is_directory_host(d):
             continue
         reg = registrable(d)
-        if reg and not JUNK_DOMAIN.search(reg):
+        if reg and not JUNK_DOMAIN.search(reg) and not is_directory_host(reg):
             counts[reg] += 1
     return counts
 
@@ -1000,7 +986,7 @@ def search_candidates(name, args):
         # 域名出现在公司名附近的上下文，权重远高于全页裸域名。
         for m in DOMAIN_RE.finditer(html or ""):
             reg = registrable(m.group(1).lower().strip("."))
-            if not reg or JUNK_DOMAIN.search(reg):
+            if not reg or JUNK_DOMAIN.search(reg) or is_directory_host(reg):
                 continue
             window = normalize_key(html[max(0, m.start() - 220):m.start() + 220])
             if (full_key and full_key in window) or (core_key and core_key in window):
@@ -1018,7 +1004,8 @@ def search_candidates(name, args):
             for m in re.finditer(r"https?://([^/\"'\s<>\\]+)", html):
                 host = m.group(1).split("@")[-1].split(":")[0].lower()
                 reg = registrable(host)
-                if reg and len(reg.split(".")[0]) >= 3 and not JUNK_DOMAIN.search(reg):
+                if (reg and len(reg.split(".")[0]) >= 3
+                        and not JUNK_DOMAIN.search(reg) and not is_directory_host(reg)):
                     if reg not in order:
                         order[reg] = len(order)
                     counts[reg] += 1
@@ -1040,8 +1027,14 @@ def search_candidates(name, args):
 
 
 def site_score(name, page):
-    """给候选首页打分：公司名命中标题/正文是主证据，联系方式/备案是补强。"""
+    """给候选首页打分：公司名命中标题/正文是主证据，联系方式/备案是补强。
+
+    黄页/工商/名录/B2B 聚合站会把企业名写进列表页，仅靠命中无法与官网区分，
+    因此这类域名直接判 0 分，不参与候选排序。
+    """
     if not page:
+        return 0
+    if is_directory_host(page.get("url", "")):
         return 0
     full = normalize_key(name)
     core = normalize_key(core_company_name(name))
@@ -1087,6 +1080,13 @@ def discover_site(name, provided, args, confidence=""):
 
     返回值含逐候选分数（`candidates`），供 --discover-only 生成复核表。
     """
+    if provided:
+        url = norm_url(provided.split(",")[0].strip())
+        if is_directory_host(url):
+            # 用户或复核表填的是黄页/工商/名录站，不是企业官网：
+            # 不采用该站，改为按公司名自动重新发现真实官网。
+            log(f"[site] 忽略目录/聚合站（{url}），改为自动发现：{name}")
+            provided = ""
     if provided:
         url = norm_url(provided.split(",")[0].strip())
         page, r = fetch_site(url, args)
@@ -1434,6 +1434,10 @@ def download_images(name, pages, home, args):
         if total >= args.max_images:
             break
         page_cat = page.get("cat", "")
+        # 目录/聚合站（黄页、工商信息、名录、B2B）整站素材与目标企业无关，
+        # 在下载前直接跳过，避免广告图、二维码、无关缩略图进入交付。
+        if is_directory_host(page.get("url", "")):
+            continue
         for img in page.get("images", []):
             if total >= args.max_images:
                 break
@@ -1442,6 +1446,8 @@ def download_images(name, pages, home, args):
                 continue
             src = img.get("src", "")
             if not src.startswith(("http://", "https://")):
+                continue
+            if is_directory_host(src):
                 continue
             r = fetch(src, args, binary=True, referer=page.get("url", ""))
             body = r.get("body") or b""
@@ -1893,6 +1899,12 @@ def crawl_company(item, args, out_root):
         archive["资料备注"] = resource_notes_summary(res_notes)
     # 两阶段流程：发现/复核结果由 main 预置，避免重复搜索。
     discovered = item.get("_site_discovery") or discover_site(name, item.get("website", ""), args)
+    if discovered.get("url") and is_directory_host(discovered["url"]):
+        # 兜底：任何来源（用户提供/复核表/自动发现）落在目录聚合站上都不采集。
+        log(f"[site] 确认官网为目录/聚合站，放弃采集：{discovered['url']}")
+        discovered = {"url": "", "confidence": "",
+                      "page": None, "error": f"目录/聚合站不作为官网：{discovered['url']}",
+                      "candidates": []}
     archive["官网"] = discovered.get("url", "")
     archive["置信度"] = discovered.get("confidence", "")
     if discovered.get("error"):
@@ -2314,7 +2326,7 @@ def build_visual_review(stage, deliverable, raw_dir):
 
 
 def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=None,
-              require_visual=False, allow_no_english=False):
+              require_visual=True, allow_no_english=False):
     gate = Path(__file__).with_name("gates.py")
     if not gate.is_file():
         return None, "找不到 gates.py"
@@ -2325,8 +2337,7 @@ def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=No
     ]
     if visual:
         cmd += ["--visual", str(visual)]
-    if require_visual:
-        cmd += ["--require-visual"]
+    cmd += ["--require-visual" if require_visual else "--skip-visual-review"]
     if allow_no_english:
         cmd += ["--accept-no-english"]
     proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
@@ -2531,8 +2542,10 @@ def main():
                     help="原始资料备份目录（默认 <输出目录>\\原始资料备份，在 deliverable 之外）")
     ap.add_argument("--browser-probe", dest="browser_probe", action="store_true",
                     help="只探测渲染内核（chromium/msedge/msedge-exe/none）后退出")
-    ap.add_argument("--require-visual", dest="require_visual", action="store_true",
-                    help="视觉核对未完成按门禁 error 处理（推荐：Codex 看图回写结论后再发布）")
+    ap.add_argument("--require-visual", dest="require_visual", action="store_true", default=True,
+                    help="兼容旧参数；视觉核对未完成默认按门禁 error 处理")
+    ap.add_argument("--skip-visual-review", dest="skip_visual_review", action="store_true",
+                    help="显式跳过视觉核对门禁（仅调试/用户明确授权时使用）")
     ap.add_argument("--publish-stage", default="",
                     help="不重新抓取，把已完成的 build/<run_id> 目录发布到 --out")
     ap.add_argument("--no-publish", dest="no_publish", action="store_true",
@@ -2554,6 +2567,19 @@ def main():
         stage = Path(args.publish_stage).expanduser().resolve()
         if not stage.is_dir():
             raise SystemExit(f"找不到已完成的构建目录：{stage}")
+        manifest_path = stage / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+        visual = stage / "视觉核对.json"
+        passed, gate_log = run_gates(
+            stage, stage / "deliverable", stage / "raw", stage / "en.json", stage / "汇总.xlsx",
+            int(manifest.get("companies") or 0), visual if visual.is_file() else None,
+            require_visual=not args.skip_visual_review,
+            allow_no_english=bool(manifest.get("accept_no_english")),
+        )
+        log("\n" + (gate_log or "未运行门禁"))
+        if not passed:
+            log(f"门禁未通过，拒绝发布：{stage}")
+            return 1
         out = Path(args.out).expanduser().resolve()
         published = publish(stage, out, stage.name)
         log(f"已发布：{published}")
@@ -2650,7 +2676,7 @@ def main():
         visual_path, visual_log = build_visual_review(stage, deliverable, raw_dir)
         if visual_path:
             log(f"  视觉核对材料：{stage / 'review'}")
-            log("  请查看拼版后把结论写回 视觉核对.json，再跑 gates.py；未核对项默认告警。")
+            log("  请查看拼版后把结论写回 视觉核对.json，再跑 gates.py；未完成视觉核对会按 error 阻断门禁。")
         else:
             log(f"  视觉核对材料生成失败，门禁将按待核对处理：{visual_log.strip()[:300]}")
     write_json(stage / "manifest.json", {
@@ -2666,7 +2692,7 @@ def main():
     })
     passed, gate_log = run_gates(
         stage, deliverable, raw_dir, en_path, summary, len(archives), visual_path,
-        require_visual=args.require_visual,
+        require_visual=not args.skip_visual_review,
         allow_no_english=args.accept_no_english,
     )
     log("\n" + (gate_log or "未运行门禁"))

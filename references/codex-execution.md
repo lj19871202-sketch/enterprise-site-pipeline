@@ -117,8 +117,9 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | `-HtmlDir <目录>` / `--html-dir <目录>` | 用 Codex 内置浏览器保存的离线 HTML 兜底抓取（目录内需 `manifest.json`，形如 `{"https://a.com/":"a.html"}`） |
 | `-Resources <目录>` / `--resources <目录>` | 用户资料总目录：每家企业一个任意命名子文件夹，或单家企业文件夹；结构与格式不限（图片/Word/Excel/PDF/PPT/txt…） |
 | `-BackupDir <目录>` / `--backup-dir <目录>` | 原始资料备份目录，默认 `<输出目录>\原始资料备份`，位于 `deliverable` 之外，保留原目录结构 |
-| `--require-visual` | 视觉核对未完成时按 error 处理，发布前应开启 |
-| `--publish-stage <build/run_id>` | 不重抓，直接把已完成的 stage 发布到 `--out` |
+| `--require-visual` | 兼容参数；视觉核对现已默认强制，未完成时按 error 处理 |
+| `--skip-visual-review` | 仅用户明确接受“不做视觉核对”风险时使用，显式把未核对降为告警 |
+| `--publish-stage <build/run_id>` | 不重抓，先把该 stage 跑完整门禁，通过后才发布到 `--out` |
 | `--no-publish` | 门禁通过也不发布，仅保留 build 目录，供 Codex 看图核对后再发布 |
 | `--proxy URL` | 使用本机 HTTP(S) 代理 |
 | `--insecure` | 跳过 TLS 校验，仅用于用户明确承认的测试环境 |
@@ -127,7 +128,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | `--accept-no-english` | 仅由用户明确接受中文版时使用；英文相关门禁降为告警 |
 | `--translate-email MAIL` | 可选，MyMemory 联系邮箱，提高匿名翻译额度 |
 | `--translate-delay SEC` | 每次翻译调用后的间隔秒数，默认 0.2 |
-| `--no-visual-review` | 跳过拼版、图片核对表和 `视觉核对.json` 生成 |
+| `--no-visual-review` | 跳过拼版、图片核对表和 `视觉核对.json` 生成；默认仍会被视觉门禁阻断，除非同时显式 `--skip-visual-review` |
 | `--strict` | 门禁未通过时返回非零退出码；`run_local.ps1` 默认透传，`-AllowRed` 可关闭 |
 
 ## 五、运行结果怎么看
@@ -192,7 +193,7 @@ MyMemory 429/限流时，自检只给 `[WARN]`；正式生成会在 `<run_id>/�
 ```text
 <run_id>\review\视觉核对图\<企业>\0.总览.png    # 四类速览
 <run_id>\review\视觉核对图\<企业>\<分类>.png     # 分类拼版，单页 ≤12 张、≤1MB；超出为 <分类>_p1.png、_p2.png…
-<run_id>\review\<企业>\图片核对表.xlsx           # 带缩略图，结论列可下拉
+<run_id>\review\<企业>\图片核对表.xlsx           # 带缩略图、结论下拉、SHA256、信任层级
 <run_id>\review\核对指引.md                       # Codex 看图清单、判断口径和执行命令
 <run_id>\视觉核对.json                            # 结论载体
 ```
@@ -202,9 +203,9 @@ Codex 必须自己完成看图核对，不得把判断推给用户。拼版图�
 步骤：
 
 1. 先跑 `scripts\session_guard.py` 查会话体积（>20MB 换会话），再打开 `review\核对指引.md`，按其中列出的绝对路径逐家看图；
-2. 图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt），按指引标注的序号范围打开对应 `<分类>_pN.png` 逐张核对；图片少时打开 `0.总览.png` 初筛、疑点再看分类拼版；同时确认简介 docx 与产品清单是否和原始页面一致；
-3. 把结论写进 `review\verdicts.json`（类别层或单张图均可），再用 `visual_review.py --apply` 回写 `视觉核对.json`；
-4. 用 `gates.py --require-visual` 复核，全绿后用 `local_pipeline.py --publish-stage` 发布。
+2. 图片多时先用 `<企业>/图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt/SHA256/信任层级），按指引标注的序号范围打开对应 `<分类>_pN.png`。官网抓取图逐张核对；用户资料图按资料优先直通，但标“不符”仍会阻断；同时确认简介 docx 与产品清单是否和原始页面一致；
+3. 把结论写进 `review\verdicts.json`，只支持逐张图结论，不支持类别继承；再用 `visual_review.py --apply` 回写 `视觉核对.json`，由脚本自动绑定当前 sha256 与 reviewed_at；
+4. 用 `gates.py` 复核（视觉默认强制）；全绿后用 `local_pipeline.py --publish-stage` 发布，发布前会再跑一次完整门禁。
 
 回写与发布命令示例：
 
@@ -219,8 +220,7 @@ python "$SkillRoot\scripts\gates.py" `
   --deliverable "$Run\deliverable" `
   --raw "$Run\raw" `
   --en "$Run\en.json" `
-  --summary "$Run\汇总.xlsx" `
-  --require-visual
+  --summary "$Run\汇总.xlsx"
 python "$SkillRoot\scripts\local_pipeline.py" `
   --publish-stage "$Run" `
   --out "D:\path\企业官网资料包"
@@ -231,10 +231,6 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 ```jsonc
 {
   "示例科技有限公司": {
-    "类别": {
-      "1.企业工厂图": {"结论": "符合", "说明": ""},
-      "2.企业产品图": {"结论": "不符", "说明": "混入车间照片，需人工重分类"}
-    },
     "图片": {
       "2.企业产品图/01_prod.jpg": {"结论": "不符", "说明": "实际是车间照片"}
     },
@@ -246,10 +242,11 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 规则：
 
-- 类别结论非空时，该类未单独标注的图片继承类别结论；单张结论优先。
+- 只认逐张 `图片` 结论，不支持类别继承；旧式 `类别` 节点会被忽略。
+- 官网抓取图留空、缺 sha256 或缺 reviewed_at 均为待核对，默认按 error 阻断发布。
 - 填“不符”会让 `visual_review` 门禁报 error，即使其他门禁全绿也不会发布。
-- 留空即待核对，默认只告警；加 `--require-visual` 后按 error。
-- 重跑 `visual_review.py` 或整条流水线会合并保留已有结论。
+- 用户资料图（`source: 用户资料`）按分级信任直通，不要求逐张结论；但显式“不符”仍 error。
+- 重跑 `visual_review.py` 或整条流水线时，只有旧结论的 sha256 与当前图片一致才会保留；图片变化即清空并重新核对。
 
 ## 八、故障排查
 
@@ -265,12 +262,12 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | 非空产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 429 在自检中为可恢复 `WARN`；正式生成会写英文补译清单。可稍后重跑、加 `--translate-email`，或由 Codex 补 `--en` 草稿；来源本来无详情时应留空，不算英文缺口 |
 | 页面抓取慢 | 超时、最大页数、页面数量 | 先小样本，必要时调小 `--max-pages` |
 | 网络请求失败 | 代理、TLS、目标站点限制 | 使用 `--proxy` 或 `--insecure` 仅做明确测试 |
-| 视觉核对红 | `视觉核对.json` 的“不符”/“待核对”条目 | “不符”先重新归类或补图；未回写时由 Codex 看图后写 `review\verdicts.json` 并执行 `visual_review.py --apply`，再用 `gates.py --require-visual` 复核 |
+| 视觉核对红 | `视觉核对.json` 的“不符”/“待核对”/sha-reviewed_at 绑定条目 | “不符”先重新归类或补图；官网图未回写时由 Codex 看图后写 `review\verdicts.json` 并执行 `visual_review.py --apply`，再跑 `gates.py` 复核 |
 | 渲染内核不可用 | `--browser-probe` 输出 `none` | 确认本机 Edge 存在（Windows 默认自带）；仍无则用 `-NoPlaywrightInstall` 降级静态抓取，或联网后执行 `python -m playwright install chromium` |
 | Chromium 下载卡住 | `playwright install chromium` 长时间停在 0% | 不必下载：本机 Edge 会被自动复用；确认 `--browser-probe` 输出 `msedge` 即可 |
 | 内核和 Edge 都没有 | 反病毒/精简系统裁掉 Edge 的离线机 | 由 Codex 用内置浏览器打开目标页并保存 HTML，写 `manifest.json` 后加 `--html-dir` 兜底抓取 |
-| 视觉结论没回写 | `visual_review` 是否仍为 warn | 由 Codex 完成看图，写 `review\verdicts.json` 后执行 `visual_review.py --apply`；`--require-visual` 会把未完成核对判为 error |
-| 图片来源非官网 | `image_provenance` 的 offenders | 确认是否为企业自有站点或可信 CDN；别家站点图片必须剔除 |
+| 视觉结论没回写 | `visual_review` 是否报 error | 由 Codex 完成官网图看图，写 `review\verdicts.json` 后执行 `visual_review.py --apply`；视觉核对默认 fail-closed，未完成即为 error |
+| 图片来源非官网/直链外域 | `image_provenance` 的 offenders | 聚合/目录站、别家站点图片一律剔除并重抓；图片直链外域也判 error，不能靠视觉结论放行 |
 | 产品清单行数不符 | `product_rows`、raw `products` | 手工改过 xlsx 就重跑渲染，不要只改交付文件 |
 | 产品图本地链接为空/失效 | `product_image_link`、产品清单 `图片（本地连接）` | 检查 raw `product` 的 `alt`、文件名、来源路径、URL 是否含产品名/系列名/型号；用户资料仅一张产品图时允许作为主图兜底，多张无法唯一关联时该单元格留空，不要乱配图或写占位文字 |
 
@@ -281,4 +278,4 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 不修改用户未指定的业务文件；
 - 不在门禁红色时把结果标成终稿；
 - 输入表缺官网列时先自动发现；中/低置信度域名必须由 Codex 或用户复核，未复核默认跳过，确认前不进入正式交付；高置信度才可自动采用；
-- 视觉核对由 Codex 自己完成，不得把看图判断转交给用户；未回写结论的条目在 `--require-visual` 下按 error 处理。
+- 视觉核对由 Codex 自己完成，不得把看图判断转交给用户；官网抓取图未回写结论默认按 error 处理，用户资料图直通但“不符”仍阻断；只有用户明确接受风险时才可 `--skip-visual-review`。

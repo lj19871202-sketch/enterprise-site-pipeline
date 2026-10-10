@@ -54,7 +54,7 @@ metadata:
 
 1. **本地单一入口。** 用 `scripts/local_pipeline.py` 或 `scripts/run_local.ps1` 执行；不要再拆成远端 SSH 命令。
 2. **用户资料优先，官网补充。** 用户可能通过 `--resources` 提交资料：总目录下每家一个**任意命名**子文件夹，也可能总目录本身就是一个企业文件夹；资料**不要求按规范结构**提交，格式除图片/Word/Excel 外还可能是 PDF、PPT、txt 等。脚本递归扫描并用企业名匹配归属，图片按类别归档、文档抽文本、表格抽行列结构；冲突时**用户资料优先，官网只作补充**。原始资料一律在交付父文件夹之外备份（默认 `<输出目录>\原始资料备份`，保留用户原目录结构），便于追溯，绝不覆盖或丢弃。
-3. **官网自动发现与人工复核。** 只要 Excel 有企业名称，没有官网列也要自动发现：多引擎搜索 + 候选首页抓取 + 公司名/联系方式/备案命中打分。推荐先运行 `--discover-only` 产出《官网候选复核表.xlsx》：`score ≥ 80` 为高置信度，可自动采用；`50–79` 为中、`< 50` 为低，均须停下来人工复核，在“决定”列选择“采用/跳过”，或在“自定义官网”填写正确网址。未复核的中、低置信度企业默认跳过，不进入抓取和交付。官网找不到或不可访问但用户资料可用时，状态记为 `resource_only`，即"仅凭用户资料成档"，不算失败。
+3. **官网自动发现与人工复核。** 只要 Excel 有企业名称，没有官网列也要自动发现：多引擎搜索 + 候选首页抓取 + 公司名/联系方式/备案命中打分。推荐先运行 `--discover-only` 产出《官网候选复核表.xlsx》：`score ≥ 80` 为高置信度，可自动采用；`50–79` 为中、`< 50` 为低，均须停下来人工复核，在“决定”列选择“采用/跳过”，或在“自定义官网”填写正确网址。未复核的中、低置信度企业默认跳过，不进入抓取和交付。黄页、工商信息、名录、B2B 等聚合/目录站不参与官网候选，也不进入图片归档；统一黑名单见 `scripts/domain_rules.py`。官网找不到或不可访问但用户资料可用时，状态记为 `resource_only`，即"仅凭用户资料成档"，不算失败。
 4. **渲染默认可用，且不依赖大体积下载。** `run_local.ps1` 会优先复用本机已有 Playwright；渲染内核按 **内置 Chromium → 本机 Microsoft Edge → Edge 绝对路径** 自动选择。Windows 自带 Edge 且与 Chromium 同源，通常**无需下载 100-200MB 的 Chromium**；两者都没有才下载。抓取默认 `auto`：静态页面直接抓，疑似 JS 渲染页自动用 Playwright 重抓。内核与 Edge 都不可用时，可由 Codex 用内置浏览器保存 HTML，再以 `--html-dir` 兜底。
 5. **Excel 是输入源。** 企业名称和可选官网来自 Excel；不把聊天上下文当事实源。
 6. **抓取有证据。** 官网、页面标题、原始文本、图片 URL 和处理状态写入 `raw/*.json`。
@@ -146,7 +146,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 推荐：先构建不发布 → Codex 看图核对 → 门禁确认 → 发布。
 
 ```powershell
-# 1. 构建（playwright 默认 auto；不加 -RequireVisual，先产出核对材料）
+# 1. 构建（playwright 默认 auto；视觉核对默认强制，先产出核对材料）
 & "$SkillRoot\scripts\run_local.ps1" -Excel "D:\path\企业名录.xlsx" -Out "D:\path\企业官网资料包" -NoPublish
 
 # 2. 先查会话体积（>20MB 先另开会话），再打开 <输出目录>\build\<run_id>\review\核对指引.md：
@@ -154,7 +154,7 @@ python "$SkillRoot\scripts\session_guard.py"
 # 图片多时先用 review\<企业>\图片核对表.xlsx 初筛，按序号范围打开对应拼版页，然后：
 python "$SkillRoot\scripts\visual_review.py" --json "<输出目录>\build\<run_id>\视觉核对.json" --apply "<verdicts.json>"
 
-# 3. 视觉门禁必须通过
+# 3. 视觉门禁必须通过（--require-visual 为兼容参数，已是默认行为）
 python "$SkillRoot\scripts\gates.py" --deliverable "<输出目录>\build\<run_id>\deliverable" --raw "<输出目录>\build\<run_id>\raw" --en "<输出目录>\build\<run_id>\en.json" --summary "<输出目录>\build\<run_id>\汇总.xlsx" --visual "<输出目录>\build\<run_id>\视觉核对.json" --require-visual
 
 # 4. 发布
@@ -173,7 +173,8 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 | `-NoPlaywright` / `-NoPlaywrightInstall` | 关闭 Playwright；或只检测不自动安装 |
 | `-NoPublish` | 先构建、不发布，等 Codex 视觉核对后再发布 |
 | `--publish-stage <build/run_id>` | 视觉核对与门禁通过后，把已完成构建目录发布到 `--out` |
-| `--require-visual` / `-RequireVisual` | 视觉核对未完成按 error 处理，不允许直接发布 |
+| `--require-visual` / `-RequireVisual` | 兼容参数；视觉核对现已默认强制，未完成即 error，不允许直接发布 |
+| `--skip-visual-review` / `-SkipVisualReview` | 仅用户明确接受“不做视觉核对”风险时使用，显式把未核对降为告警；默认禁用 |
 | `--proxy` | 本机 HTTP(S) 代理 |
 | `--en <json>` | 用人工确认英文或 Codex 补译草稿覆盖自动翻译；模型草稿必须保留 `定稿: false`、`自动翻译: true` |
 | `-HtmlDir <目录>` / `--html-dir <目录>` | 用 Codex 内置浏览器保存的离线 HTML 兜底抓取（目录内需 `manifest.json`） |
@@ -183,7 +184,7 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 | `--accept-no-english` / `-AcceptNoEnglish` | 仅由用户明确接受中文版时使用；英文相关门禁降为告警，不能由 Codex 自行默认开启 |
 | `-NoBootstrap` | 禁止 `run_local.ps1` 自动创建 `.venv`，用于已确认自行管理依赖的环境 |
 | `--translate-email <邮箱>` | 可选，MyMemory 联系邮箱，用于提高匿名翻译额度 |
-| `--no-visual-review` | 跳过拼版/核对表和视觉核对.json 生成 |
+| `--no-visual-review` | 跳过拼版/核对表和视觉核对.json 生成；默认仍会被视觉门禁阻断，除非同时显式 `--skip-visual-review` |
 | `--strict` | 门禁未通过时返回非零退出码（`run_local.ps1` 默认启用；用 `-AllowRed` 关闭） |
 
 ## 流水线阶段
@@ -194,9 +195,9 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 | 0.5 | 用户资料摄入 | 递归扫描 `--resources`：图片按目录名/文件名关键词归入四类；文档（docx/xlsx/xlsm/csv/pptx/pdf/txt）抽文本与表格行列；原件在 `deliverable` 之外备份；未归类/抽取失败记入 `资料备注` | 各类资料尽可能归档；未归类项已列出，原始件已备份 |
 | 1 | 官网发现与复核 | 用户官网优先；否则多引擎自动发现并抓取候选首页，按公司名命中度分级。中/低置信度停下来生成复核表；填“采用”或“自定义官网”后再采集，未复核默认跳过 | 高置信度自动采用，或中/低已经人工决定；找不到但有用户资料时标 `resource_only`；未发现且无资料时跳过并写复核结果；用户提供/人工确认的官网不可访问且无资料时才标 `no_website` |
 | 2 | 页面抓取 | 首页 + 关于/工厂/资质页；产品分类/列表页优先并下钻一层补齐叶子分类与详情，保留标题、正文、链接、图片 | `raw/*.json` 有页面记录 |
-| 3 | 内容与图片 | 抽取中文简介、产品名、产品详情、主营和地址；只有详情或产品图佐证的条目才作为产品；识别站头 logo 与 CSS 背景横幅，图片按四类落盘。**用户资料优先、官网补充**：用户图片排在官网图片之前，用户文档事实覆盖官网推断；官网置信度为"低"时不并入官网产品 | 图片引用真实存在、非空产品详情中英双语、来源无详情时留空、产品图本地链接有效 |
+| 3 | 内容与图片 | 抽取中文简介、产品名、产品详情、主营和地址；只有详情或产品图佐证的条目才作为产品；识别站头 logo 与 CSS 背景横幅，图片按四类落盘。抓图时跳过聚合/目录站来源页和直链；官网图片直链外域或聚合站会在门禁判红。**用户资料优先、官网补充**：用户图片排在官网图片之前，用户文档事实覆盖官网推断；官网置信度为"低"时不并入官网产品 | 图片引用真实存在、官网图来源页同域且直链外域/聚合站为 0、非空产品详情中英双语、来源无详情时留空、产品图本地链接有效 |
 | 4 | 渲染 | 生成中英双语企业 docx（文件名=`<企业名>.docx`）、产品清单 xlsx、汇总 xlsx；英文缺口写 `英文补译清单.json` | 文件可打开、docx 名称与企业文件夹一致、结构完整；有英文缺口时补齐或取得用户明确接受 |
-| 5 | 视觉核对 | 生成拼版（单页 ≤12 张、≤1MB，超出按序号自动分页）、核对表和核对指引；Codex 先查会话体积、再用核对表初筛、按序号范围打开相关拼版页，经 `visual_review.py --apply` 回写 `视觉核对.json` | 无“不符”，核对完成；初筛点名的行都已给结论；每批 ≤10 家在短线程内做完 |
+| 5 | 视觉核对 | 生成拼版（单页 ≤12 张、≤1MB，超出按序号自动分页）、核对表和核对指引；Codex 先查会话体积、再用核对表初筛、按序号范围打开相关拼版页，经 `visual_review.py --apply` 回写 `视觉核对.json`。官网抓取图逐张必核；用户资料图直通 | 官网图逐张结论且无“不符”；用户资料图显式“不符”仍阻断；结论绑定 sha256 与 reviewed_at；每批 ≤10 家在短线程内做完 |
 | 6 | 门禁 | 自动调用 `gates.py` | `gates.json` 无 error |
 
 ## 开工顺序
@@ -205,10 +206,10 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 2. **官网发现与复核。** 没有官网列时先跑 `--discover-only` / `-DiscoverOnly`，打开《官网候选复核表.xlsx》，对中/低置信度逐家填写“采用”“跳过”或“自定义官网”。留空＝未复核，中/低置信度默认跳过；高置信度可留空自动采用。
 3. **小样本试跑。** 用 `-Limit 1` 或 `-Limit 3 -NoPublish`，并带上 `-SiteDecisions`（若已生成复核表），检查官网命中、图片归档、docx/xlsx、`英文补译清单.json` 和门禁日志。
 4. **完整运行。** 小样本通过后去掉 `-Limit` 运行全部企业（推荐 `-NoPublish`，先构建待核对）。
-5. **视觉核对（Codex 自己做，短线程）。** 先执行 `scripts/session_guard.py` 查本会话 rollout 体积，超过 20MB 先另开会话。然后打开 `review/核对指引.md`：图片多时先用同目录 `图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt），按指引里的**序号范围**只打开可疑的 `<分类>_pN.png` 放大确认；图片少或整类看不出疑点时可直接给类别结论。把结论写成 `verdicts.json`，执行 `visual_review.py --apply` 回写，再跑 `gates.py --require-visual`。核对完成后用 `local_pipeline.py --publish-stage <build/run_id> --out <输出目录>` 发布。**每批 ≤10 家**：一个会话做完「查体积 → 看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话处理下一批，不要把几十张拼版堆进同一个长会话。
+5. **视觉核对（Codex 自己做，短线程）。** 先执行 `scripts/session_guard.py` 查本会话 rollout 体积，超过 20MB 先另开会话。然后打开 `review/核对指引.md`：图片多时先用同目录 `图片核对表.xlsx` 初筛（分类/序号/尺寸/图片URL/来源页面/alt/SHA256/信任层级），按指引里的**序号范围**打开对应 `<分类>_pN.png`。官网抓取图必须逐张给结论；用户资料图按资料优先直通，但显式标“不符”仍会阻断。把结论写成 `verdicts.json`，执行 `visual_review.py --apply` 回写（自动绑定当前 sha256 与 reviewed_at），再跑 `gates.py`。核对完成后用 `local_pipeline.py --publish-stage <build/run_id> --out <输出目录>` 发布；`--publish-stage` 会先跑门禁，未过拒绝发布。**每批 ≤10 家**：一个会话做完「查体积 → 看图 → 回写 → 门禁 → 发布」就结束，企业多时另开会话处理下一批，不要把几十张拼版堆进同一个长会话。
 6. **复核门禁。** 先看 `gates.json` 的 error 项，再看 `empty_images`、`no_website`、`partial` 清单。
 7. **核对英文。** 默认会写入自动翻译英文草稿并标注待人工核校。MyMemory 429/限流是 `WARN` 可恢复告警，不把新环境判为不可用；英文缺口会写入 `<run_id>/英文补译清单.json`，Codex 必须基于 raw 中文事实补出 `--en` 兼容草稿后重跑。用户在当次对话中明确接受中文版时，才可加 `--accept-no-english` / `-AcceptNoEnglish`。
-8. **发布。** 默认英文缺失会阻断发布；只有补 `--en` 或用户明确接受中文版后才交付。门禁红色先修数据或补抓，不下调阈值迁就数据。
+8. **发布。** 默认英文缺失会阻断发布；只有补 `--en` 或用户明确接受中文版后才交付。`--publish-stage` 会先跑完整门禁，视觉核对未完成、结论未绑定当前图片或来源不合规都会拒绝发布。门禁红色先修数据或补抓，不下调阈值迁就数据。
 
 ## 硬性约束
 
@@ -222,9 +223,9 @@ python "$SkillRoot\scripts\local_pipeline.py" --publish-stage "<输出目录>\bu
 - **Playwright 复用优先。** `run_local.ps1` 先复用当前 Python/技能 `.venv` 中已有的 Playwright；渲染内核按内置 Chromium → 本机 Edge 自动选择，两者都不可用才考虑安装 Chromium。可用 Codex 内置浏览器保存 HTML 并经 `-HtmlDir` 兜底。
 - **机翻不等于定稿。** 自动英文来自机翻，必须在 `en.json`/汇总/交付说明中保留 `自动翻译: true`、`待人工核校` 标记，不得当作人工定稿交付。
 - **不把空结果当成功。** 四类图全空、官网未确认、简介不足三段都要显式记录并单独列出。
-- **不跳视觉核对，也不把核对推给用户。** 图片内容是否属于该企业、该分类，只能看图判断；Codex 必须自己查看拼版并回写结论，不得在未核对时声称图片已核验，也不得把 `待核对` 留给用户后发布终稿。
+- **视觉核对 fail-closed，并按来源分级信任。** 官网抓取图必须逐张看图并回写结论，未回写默认 error；只有用户明确接受风险时才可 `--skip-visual-review`。用户资料图按资料优先直通，不要求逐张结论，但一旦显式标“不符”仍阻断。结论只认逐张图，不支持类别继承；结论绑定图片 sha256 与 reviewed_at，图片变化后旧结论自动作废。来源页为聚合/目录站或图片直链外域的图直接判红，处理方式是删除重抓，不能靠视觉结论放行；不得把 `待核对` 留给用户后发布终稿。
 - **视觉核对必须在短线程完成。** 拼版图读进会话就是 base64 图片，会持续撑大会话历史并拉长每次请求（实测：19 张拼版 = 28.8MB，直接触发上游 `web_search` 报错）。每批 ≤10 家、一个会话只做「查体积 → 看图 → 回写 → 门禁 → 发布」，做完即止；企业多时另开会话，不要在长会话里累积。开工前先跑 `scripts/session_guard.py`，本会话 rollout 超过 20MB 就立即换会话。
-- **大批量先初筛。** 图片多的企业不要盲开所有拼版页：先用 `图片核对表.xlsx`（分类/序号/尺寸/图片URL/来源页面/alt）找可疑项，再按 `核对指引.md` 标注的序号范围打开对应 `<分类>_pN.png` 放大确认。初筛点名的行必须逐张给结论，`视觉核对.json` 里不得留未填的“待核对”；初筛只是先导，不能代替结论。
+- **大批量先初筛。** 图片多的企业不要盲开所有拼版页：先用 `图片核对表.xlsx`（分类/序号/尺寸/图片URL/来源页面/alt/SHA256/信任层级）找可疑项，再按 `核对指引.md` 标注的序号范围打开对应 `<分类>_pN.png` 放大确认。官网抓取图必须逐张给结论，`视觉核对.json` 里不得留未填的“待核对”；用户资料图直通，但标“不符”时同样必须处理。初筛只是先导，不能代替官网图的逐张结论。
 - **不修改无关脚本。** 只处理当前请求涉及的小样本或输入名录。
 
 ## 参考
