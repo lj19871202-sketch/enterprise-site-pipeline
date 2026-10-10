@@ -47,7 +47,7 @@ python "$SkillRoot\scripts\gates.py" `
 | `structure` | error | 每家固定为五文件夹 + 产品清单 xlsx；`5.企业介绍` 下 docx 文件名必须等于企业文件夹名；企业根目录无多余项，五文件夹内只允许直接文件、不得嵌套子目录 | 缺失数 0、多余项 0、错误 docx 名 0、嵌套目录 0 |
 | `images` | error | 档案里的图片引用都落到真实文件；交付目录里没有 raw 未记录的孤儿图；跨类重复图；四类图是否全空 | 失效引用 0、孤儿图 0、跨类重复组 0、四类全空 0 家 |
 | `image_required` | warn | 单独检查 `logo` 与 `factory` 两类是否有图；官网确实没有素材时保留告警并写数据边界，不硬性阻断 | 空类 0 条（否则告警） |
-| `image_provenance` | error | 每张官网图的来源页必须与官网同域；`source: 用户资料` 的图跳过同域校验；来源页为聚合/目录站或图片直链外域/聚合站均判 error | 来源页非官网 0 条；图片直链外域/聚合站 0 条（用户资料图除外） |
+| `image_provenance` | error | 每张官网图的来源页必须与官网同域；`source: 用户资料` 的图跳过同域校验；来源页为聚合/目录站或图片直链外域/聚合站均判 error。建站平台自有 CDN（`faiusr.com`/`faisys.com`/`508sys.com`）直链默认同样按外域判 error，仅当来源页与官网同域**且**显式开启 `--allow-builder-cdn` 时放行 | 来源页非官网 0 条；图片直链外域/聚合站 0 条（用户资料图及显式放行的建站 CDN 除外） |
 | `en_entry` | error/warn | 英文条目六字段齐全且非空；简介恰 3 段；每段 ≥60 字符；英文名/标题/品牌/简介/产品英名无中日韩字符（`子品类` 是中文分类，豁免）；只有显式 `--accept-no-english` 才降为 warn | 问题条目 0 |
 | `en_ascii` | error/warn | 英文段非 ASCII 字符占比；只有显式 `--accept-no-english` 才降为 warn | ≤ 0.02 |
 | `en_pinyin` | warn | 英文段疑似拼音/栏目词 token 占比 | ≥ 0.60 告警 |
@@ -84,6 +84,8 @@ python "$SkillRoot\scripts\gates.py" `
 **`docx_source` / `product_rows`** —— 把“交付物来自哪个事实源”也变成断言：docx 中文段必须等于 raw `intro_paragraphs`，产品清单数据行必须等于 raw `products`。手工改过交付文件却不同步 raw，会在这里报红。
 
 **`image_provenance`** —— 图片的 `from` 来源页必须与官网同域，防止把别家站点或聚合站的图当成企业自己的。聚合/黄页/工商/名录/B2B 站由 `scripts/domain_rules.py` 统一识别；来源页或图片直链命中目录站、或直链为外域时直接 error，不能靠视觉结论放行。用户资料图没有官网来源页，按资料优先跳过同域校验。
+
+建站平台（凡科等）会把企业站图片托管在自有 CDN（`faiusr.com`/`faisys.com`/`508sys.com`），直链与官网主域不同属正常现象，但默认仍按外域判 error，避免误放行真正的第三方素材。只有满足**双条件**——`from` 来源页与官网同域、且用户显式开启 `--allow-builder-cdn`——才不再计入直链外域；任一不满足仍判红。放行是显式、可追溯的：`manifest.json` 会记录 `allow_builder_cdn` 的取值，未开启时保持默认严格。
 
 **`visual_review`** —— 机器只能判“文件和引用对得上”，判不了“这张图到底是不是工厂/产品/logo/资质”。视觉核对由 Codex 自己打开拼版完成：先看核对表「锚点线索」，图片内容要能挂到本企业已证实的名称/产品/品类才判「符合」；把结论写进 `review\verdicts.json`（可用 `依据` 写清命中哪个锚点/来源），用 `visual_review.py --apply` 回写 `视觉核对.json`。默认 fail-closed：结论三档 `符合/不符/待核对`，只有 `符合` 放行；官网抓取图留空或填“待核对”即 error；填“不符”直接 error。用户资料图按资料优先直通，不要求逐张结论，但显式“不符”仍阻断。结论只认逐张图，不支持类别继承；每张结论绑定 sha256 和 reviewed_at，图片变化后旧结论自动作废。只有用户明确接受风险时，`--skip-visual-review` 才把未核对降为 warn。
 

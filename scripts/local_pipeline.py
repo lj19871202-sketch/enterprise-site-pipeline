@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as _dt
+import gzip
 import hashlib
 import html as _html
 import json
@@ -27,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -223,6 +225,19 @@ IMG_ALT_NOISE = (
 )
 
 
+CONTACT_ALT_RE = re.compile(
+    r"[\w.+-]+@[\w-]+\.[\w.-]+"                      # 邮箱
+    r"|\+\d[\d\s\-()]{6,}"                           # 国际电话 +86 ...
+    r"|(?<!\d)\d{7,}(?!\d)"                            # 7 位以上号码
+    r"|(?:省|自治区).{0,10}(?:市|区|县|镇|路|街|工业园区|工业园|大厦)"
+    r"|(?:address|tel|phone|e-?mail)\b", re.I)
+
+
+def is_contact_alt(alt):
+    """判断图片 alt 是否为联系方式（电话/邮箱/地址），用于剔除网站图标。"""
+    return bool(alt and CONTACT_ALT_RE.search(alt))
+
+
 def image_category(img, page_cat):
     alt = clean_inline(img.get("alt", ""))
     s = (clean_inline(img.get("src", "")) + " " + alt).lower()
@@ -238,6 +253,8 @@ def image_category(img, page_cat):
     # 部分模板 logo 无 alt 或 alt 恰为公司名，必须在 alt 噪声过滤前判定。
     if img.get("home_link"):
         return "logo"
+    if alt and is_contact_alt(alt):
+        return ""
     if alt and any(w in alt.lower() for w in IMG_ALT_NOISE):
         return ""
     if any(w in s for w in ("cert", "证书", "资质", "荣誉", "认证", "award")):
@@ -250,9 +267,18 @@ def image_category(img, page_cat):
 
 
 def is_home_href(href):
-    """判断链接是否指向站点首页（用于识别站头 logo 所在的链接）。"""
+    """判断链接是否指向站点首页（用于识别站头 logo 所在的链接）。
+
+    兼容相对写法（/、./index.html）与同站绝对写法（http://host/、https://host/index.html）。
+    """
     h = clean_inline(href).split("#")[0].split("?")[0].strip().lower()
-    return h in ("/", "./", "./index.html", "index.html", "/index.html")
+    if h in ("/", "./", "./index.html", "index.html", "/index.html"):
+        return True
+    if "://" in h:
+        rest = h.split("://", 1)[1]
+        path = rest[rest.find("/"):] if "/" in rest else "/"
+        return path in ("", "/", "/index.html")
+    return False
 
 
 class PageParser(HTMLParser):
@@ -347,7 +373,38 @@ class PageParser(HTMLParser):
             self._li.append(s)
 
 
+def decompress_body(body, headers):
+    """按 Content-Encoding 解压响应体；服务端强制 gzip 时静态抓取不会自动解压。"""
+    enc = ""
+    try:
+        enc = (headers.get("Content-Encoding") or "").strip().lower()
+    except Exception:
+        enc = ""
+    if not enc or enc == "identity" or not body:
+        return body
+    try:
+        if "gzip" in enc:
+            return gzip.decompress(body)
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(body)
+            except Exception:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+    except Exception:
+        return body
+    return body
+
+
+def sanitize_text(text):
+    """剔除 XML 控制字符，避免写 docx 时抛 XML compatible 错误。"""
+    if not text:
+        return text
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return re.sub(r"[\ud800-\udfff]", "", text)
+
+
 def decode_body(body, headers):
+    body = decompress_body(body, headers)
     charset = ""
     try:
         charset = headers.get_content_charset() or ""
@@ -361,10 +418,10 @@ def decode_body(body, headers):
         if not enc:
             continue
         try:
-            return body.decode(enc)
+            return sanitize_text(body.decode(enc))
         except Exception:
             continue
-    return body.decode("utf-8", "replace")
+    return sanitize_text(body.decode("utf-8", "replace"))
 
 
 def build_opener(proxy="", insecure=False):
@@ -2070,22 +2127,26 @@ def make_docx(path, archive, en_entry):
 
 
 def _product_match_keys(product):
-    """产品名的可匹配键：全名、系列/型号前缀、型号 token。"""
+    """产品名的可匹配键：整名/主体=强键(2)，型号 token=弱键(1)。
+
+    返回 {key: weight}。强键用于完整产品族匹配，弱键只在精确相等时才够用，
+    避免多个型号共享同一段后缀（如 10X100T 退化成 X100T）而一张图错挂多行。
+    """
     text = clean_inline(product)
-    keys = set()
+    keys = {}
+
+    def add(key, weight):
+        if len(key) >= 2:
+            keys[key] = max(keys.get(key, 0), weight)
+
     for value in (text, product_series(text)):
-        key = normalize_key(value)
-        if len(key) >= 3:
-            keys.add(key)
+        add(normalize_key(value), 2)
     # “储能柜 型号 ESS-100”这类名称，型号前的主体是有效的产品族匹配词。
     base = re.split(r"\s*(?:型号|model|spec(?:ification)?)\s*", text, flags=re.I)[0]
-    base_key = normalize_key(base)
-    if len(base_key) >= 3:
-        keys.add(base_key)
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*|\d{2,}", text):
-        key = normalize_key(token)
-        if len(key) >= 3:
-            keys.add(key)
+    add(normalize_key(base), 2)
+    # 型号整体抽取（字母数字混合，含 10X100T）；裸数字片段不再当作键。
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*", text):
+        add(normalize_key(token), 1)
     return keys
 
 
@@ -2109,7 +2170,7 @@ def _product_image_keys(item):
             key = normalize_key(piece)
             if len(key) >= 2:
                 keys.add(key)
-            for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*", piece):
+            for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9._-]*\d[A-Za-z0-9._-]*", piece):
                 token_key = normalize_key(token)
                 if len(token_key) >= 2:
                     keys.add(token_key)
@@ -2117,13 +2178,16 @@ def _product_image_keys(item):
 
 
 def _product_image_match_score(product_keys, candidate_keys):
-    """完全匹配优先，其次才接受产品名/系列名/型号与图片元数据互相包含。"""
+    """打分：强键(整名/主体)精确=4、弱键(型号)精确=3、强键包含=2。
+
+    只允许强键做包含匹配；弱型号键必须精确相等，避免共享后缀串图。
+    """
     best = 0
-    for pkey in product_keys:
+    for pkey, weight in product_keys.items():
         for ckey in candidate_keys:
             if pkey == ckey:
-                best = max(best, 3)
-            elif len(pkey) >= 3 and len(ckey) >= 3 and (pkey in ckey or ckey in pkey):
+                best = max(best, 3 + (1 if weight >= 2 else 0))
+            elif weight >= 2 and len(pkey) >= 3 and len(ckey) >= 3 and (pkey in ckey or ckey in pkey):
                 best = max(best, 2)
     return best
 
@@ -2326,7 +2390,7 @@ def build_visual_review(stage, deliverable, raw_dir):
 
 
 def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=None,
-              require_visual=True, allow_no_english=False):
+              require_visual=True, allow_no_english=False, allow_builder_cdn=False):
     gate = Path(__file__).with_name("gates.py")
     if not gate.is_file():
         return None, "找不到 gates.py"
@@ -2340,6 +2404,8 @@ def run_gates(stage, deliverable, raw_dir, en_path, summary, expected, visual=No
     cmd += ["--require-visual" if require_visual else "--skip-visual-review"]
     if allow_no_english:
         cmd += ["--accept-no-english"]
+    if allow_builder_cdn:
+        cmd += ["--allow-builder-cdn"]
     proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
     (stage / "gates.log").write_text(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), encoding="utf-8")
     return proc.returncode == 0, proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
@@ -2557,6 +2623,9 @@ def main():
                     help="用户明确接受中文版；英文相关门禁降为告警，不建议用于默认双语交付")
     ap.add_argument("--translate-email", default="", help="可选：MyMemory 联系邮箱，用于提高匿名额度")
     ap.add_argument("--translate-delay", type=float, default=0.2, help="每次翻译调用后的间隔秒数")
+    ap.add_argument("--allow-builder-cdn", dest="allow_builder_cdn", action="store_true",
+                    help="放行建站平台自有 CDN（faiusr.com/faisys.com/508sys.com）的图片直链，"
+                         "仅当来源页与官网同域时生效；默认关闭")
     ap.add_argument("--no-visual-review", dest="no_visual_review", action="store_true",
                     help="跳过图片拼版/核对表和视觉核对.json 生成")
     args = ap.parse_args()
@@ -2575,6 +2644,7 @@ def main():
             int(manifest.get("companies") or 0), visual if visual.is_file() else None,
             require_visual=not args.skip_visual_review,
             allow_no_english=bool(manifest.get("accept_no_english")),
+            allow_builder_cdn=bool(args.allow_builder_cdn or manifest.get("allow_builder_cdn")),
         )
         log("\n" + (gate_log or "未运行门禁"))
         if not passed:
@@ -2685,6 +2755,7 @@ def main():
         "english_final": bool(args.en),
         "english_mode": "final" if args.en else ("off" if args.no_translate else "auto"),
         "accept_no_english": bool(args.accept_no_english),
+        "allow_builder_cdn": bool(args.allow_builder_cdn),
         "english_backlog": backlog_path,
         "visual_review": str(visual_path) if visual_path else "",
         "visual_review_dir": str(stage / "review") if visual_path else "",
@@ -2694,6 +2765,7 @@ def main():
         stage, deliverable, raw_dir, en_path, summary, len(archives), visual_path,
         require_visual=not args.skip_visual_review,
         allow_no_english=args.accept_no_english,
+        allow_builder_cdn=args.allow_builder_cdn,
     )
     log("\n" + (gate_log or "未运行门禁"))
     if passed:

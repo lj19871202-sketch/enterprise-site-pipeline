@@ -20,7 +20,7 @@ import os
 import re
 import sys
 
-from domain_rules import is_directory_host
+from domain_rules import is_builder_cdn_host, is_directory_host
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -350,7 +350,13 @@ def gate_image_provenance(ctx):
                 if is_directory_host(it.get("url", "")):
                     offsite.append(f"{label}: 图片直链为目录/聚合站 {uh}")
                 elif uh and site_host and not same_host(uh, site_host):
-                    offsite.append(f"{label}: 图片直链外域 {uh}，按分层信任规则丢弃")
+                    # 仅当"来源页与官网同域"且"直链落在建站平台自有 CDN"且用户显式
+                    # 开启 --allow-builder-cdn 时放行；其余外域照旧判红。
+                    if (ctx.get("allow_builder_cdn") and same_host(fh, site_host)
+                            and is_builder_cdn_host(uh)):
+                        pass
+                    else:
+                        offsite.append(f"{label}: 图片直链外域 {uh}，按分层信任规则丢弃")
     detail = (f"来源页非官网/缺源 {len(bad)} 条；图片直链外域/聚合站 {len(offsite)} 条；"
               f"用户资料图 {len(user_src)} 条（按资料优先通过）")
     return Gate("image_provenance", "error", not bad and not offsite, detail, bad + offsite)
@@ -787,6 +793,9 @@ def main():
                     help="显式跳过视觉核对门禁（仅调试/用户明确授权时使用）")
     ap.add_argument("--accept-no-english", action="store_true",
                     help="用户明确接受中文版；英文缺失降为告警")
+    ap.add_argument("--allow-builder-cdn", dest="allow_builder_cdn", action="store_true",
+                    help="放行建站平台自有 CDN（faiusr.com/faisys.com/508sys.com）的图片直链，"
+                         "仅当来源页与官网同域时生效；默认关闭")
     ap.add_argument("--expected", type=int, default=0, help="期望企业数，0=不校验")
     ap.add_argument("--only", default="", help="只跑指定门禁，逗号分隔")
     ap.add_argument("--json", dest="json_out", default="", help="把结果写 json")
@@ -824,6 +833,7 @@ def main():
         "visual": visual_path,
         "require_visual": not bool(a.skip_visual_review or cfg.get("skip_visual_review")),
         "accept_no_english": bool(a.accept_no_english or cfg.get("accept_no_english")),
+        "allow_builder_cdn": bool(a.allow_builder_cdn or cfg.get("allow_builder_cdn")),
         "expected": a.expected or int(cfg.get("expected_companies") or 0),
         "ascii_max": (a.ascii_max if a.ascii_max is not None
                       else float(cfg.get("ascii_max", 0.02))),

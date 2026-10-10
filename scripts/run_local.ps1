@@ -22,6 +22,7 @@
     [switch]$NoPublish,             # 先只构建，Codex 核对后再 --publish-stage
     [int]$PlaywrightInstallTimeoutSec = 600,  # 单次 Playwright/Chromium 安装超时（秒）
     [switch]$NoBootstrap,          # 缺核心依赖时不自动创建 .venv
+    [switch]$AllowBuilderCdn,      # 放行建站平台自有 CDN（faiusr/faisys/508sys），默认关闭；仅来源页同域时生效
     # 默认严格模式：门禁出现 error 时返回非零退出码；缺失英文须用 -En 补稿或显式 -AcceptNoEnglish。
     # 仅在明确接受"红灯产物"的调试场景加 -AllowRed 关闭。
     [switch]$AllowRed
@@ -233,6 +234,7 @@ if ($SkipVisualReview) {
     $runArgs += "--require-visual"
 }
 if ($NoPublish) { $runArgs += "--no-publish" }
+if ($AllowBuilderCdn) { $runArgs += "--allow-builder-cdn" }
 if (-not $AllowRed) { $runArgs += "--strict" }
 
 & $python @runArgs

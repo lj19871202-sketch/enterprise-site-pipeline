@@ -129,6 +129,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | `--translate-email MAIL` | 可选，MyMemory 联系邮箱，提高匿名翻译额度 |
 | `--translate-delay SEC` | 每次翻译调用后的间隔秒数，默认 0.2 |
 | `--no-visual-review` | 跳过拼版、图片核对表和 `视觉核对.json` 生成；默认仍会被视觉门禁阻断，除非同时显式 `--skip-visual-review` |
+| `--allow-builder-cdn` / `-AllowBuilderCdn` | 放行建站平台自有 CDN（`faiusr.com`/`faisys.com`/`508sys.com`）上的官网图片直链。双条件：来源页与官网同域**且**直链落在上述 CDN；任一不满足仍判外域。默认关闭 |
 | `--strict` | 门禁未通过时返回非零退出码；`run_local.ps1` 默认透传，`-AllowRed` 可关闭 |
 
 ## 五、运行结果怎么看
@@ -273,13 +274,14 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 | 英文门禁红 | `en.json` 的 `翻译失败`、`英文补译清单.json`、`en_entry`、`en_ascii`、`product_detail` | 正常修复是 Codex 基于 raw 中文事实生成 `--en` 草稿并重跑（保留 `定稿: false`、`自动翻译: true`）；只有用户明确接受中文版才加 `--accept-no-english` |
 | 非空产品详情缺英文译文 | MyMemory 返回 HTTP 429 限流 | 429 在自检中为可恢复 `WARN`；正式生成会写英文补译清单。可稍后重跑、加 `--translate-email`，或由 Codex 补 `--en` 草稿；来源本来无详情时应留空，不算英文缺口 |
 | 页面抓取慢 | 超时、最大页数、页面数量 | 先小样本，必要时调小 `--max-pages` |
+| 抓回的正文/标题是乱码或含控制字符 | 站点是否用 gzip/deflate 压缩响应 | 已按 `Content-Encoding` 自动解压并清理控制字符/孤立代理项；若仍异常，检查目标站是否为非标准编码，必要时用 `--html-dir` 吃内置浏览器保存的离线 HTML |
 | 网络请求失败 | 代理、TLS、目标站点限制 | 使用 `--proxy` 或 `--insecure` 仅做明确测试 |
 | 视觉核对红 | `视觉核对.json` 的“不符”/“待核对”/sha-reviewed_at 绑定条目 | “不符”先重新归类或补图；官网图未回写时由 Codex 看图后写 `review\verdicts.json` 并执行 `visual_review.py --apply`，再跑 `gates.py` 复核 |
 | 渲染内核不可用 | `--browser-probe` 输出 `none` | 确认本机 Edge 存在（Windows 默认自带）；仍无则用 `-NoPlaywrightInstall` 降级静态抓取，或联网后执行 `python -m playwright install chromium` |
 | Chromium 下载卡住 | `playwright install chromium` 长时间停在 0% | 不必下载：本机 Edge 会被自动复用；确认 `--browser-probe` 输出 `msedge` 即可 |
 | 内核和 Edge 都没有 | 反病毒/精简系统裁掉 Edge 的离线机 | 由 Codex 用内置浏览器打开目标页并保存 HTML，写 `manifest.json` 后加 `--html-dir` 兜底抓取 |
 | 视觉结论没回写 | `visual_review` 是否报 error | 由 Codex 完成官网图看图，写 `review\verdicts.json` 后执行 `visual_review.py --apply`；视觉核对默认 fail-closed，未完成即为 error |
-| 图片来源非官网/直链外域 | `image_provenance` 的 offenders | 聚合/目录站、别家站点图片一律剔除并重抓；图片直链外域也判 error，不能靠视觉结论放行 |
+| 图片来源非官网/直链外域 | `image_provenance` 的 offenders | 聚合/目录站、别家站点图片一律剔除并重抓；图片直链外域也判 error，不能靠视觉结论放行。若 offender 是建站平台自有 CDN（`faiusr.com`/`faisys.com`/`508sys.com`）且来源页与官网同域，属平台正常托管：显式加 `--allow-builder-cdn`（`run_local.ps1` 加 `-AllowBuilderCdn`）后重跑；不确定时不要开 |
 | 产品清单行数不符 | `product_rows`、raw `products` | 手工改过 xlsx 就重跑渲染，不要只改交付文件 |
 | 产品图本地链接为空/失效 | `product_image_link`、产品清单 `图片（本地连接）` | 检查 raw `product` 的 `alt`、文件名、来源路径、URL 是否含产品名/系列名/型号；用户资料仅一张产品图时允许作为主图兜底，多张无法唯一关联时该单元格留空，不要乱配图或写占位文字 |
 

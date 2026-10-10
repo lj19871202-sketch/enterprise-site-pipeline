@@ -82,3 +82,26 @@ def is_directory_host(url_or_host):
         if host == suffix or host.endswith("." + suffix):
             return True
     return bool(DIRECTORY_LABEL_RE.search(host))
+
+
+BUILDER_CDN_SUFFIXES = ("faiusr.com", "faisys.com", "508sys.com")
+"""建站平台（凡科等）自有资源 CDN 主域。
+
+这类平台把企业站的图片托管在与官网主域不同的 CDN 上，例如
+``34067372.s21i.faiusr.com``。仅凭"直链与官网不同域"就把它们判为外域，
+会把真实企业站素材全部误杀。是否放行由调用方（gates.py 的
+``--allow-builder-cdn``）决定，默认不放行。
+"""
+
+
+def is_builder_cdn_host(url_or_host):
+    """判断域名是否属于建站平台自有资源 CDN（可与官网主域不同）。"""
+    host = (url_or_host or "").strip().lower().strip(".")
+    if "://" in host:
+        host = host_of(host)
+    if not host:
+        return False
+    for suffix in BUILDER_CDN_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return True
+    return False
