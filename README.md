@@ -140,7 +140,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 
 - 图片引用必须存在、交付目录没有 raw 未记录的孤儿图、四类图片不能全空；
 - `logo` 或 `factory` 单独为空时给出告警，要求补图或标记数据边界；
-- 每张图的来源页必须与官网同域（图片直链走 CDN 仅提示）；
+- 每张图的来源页必须与官网同域；来源页或图片直链命中黄页/工商/名录/B2B 目录站，或直链为外域，均判 error（用户资料图除外）；
 - 每家企业必须是一层结构：四类图片目录 + `5.企业介绍/` + `产品清单.xlsx`；企业根目录无多余项，五个文件夹内不得嵌套子目录；
 - `5.企业介绍/<企业名>.docx` 文件名必须与企业文件夹名完全一致；docx 中文段必须等于 raw `intro_paragraphs`，产品清单数据行必须等于 raw `products`；`产品详情` 列只填官网或企业资料中真实存在的非空内容，非空时必须中英双语，来源无详情时留空且不得写占位说明；`图片（本地连接）` 列必须指向交付目录内真实存在的 `2.企业产品图/...` 文件；来源没有对应产品图时留空，不得写占位说明；
 - 英文默认自动中译英并写入正文，`en.json` 标 `自动翻译: true` 待人工核校；提供 `--en` 后覆盖，人工确认稿标 `定稿: true`，MyMemory 失败时由 Codex 补翻的草稿仍标 `定稿: false`；
@@ -148,7 +148,7 @@ python "$SkillRoot\scripts\local_pipeline.py" `
 - 官网必须确认；中/低置信度未复核的企业在进入门禁前已默认跳过，若异常进入 `raw`/交付，`site_discovery` 直接报 error。官网未确认或不可访问但用户资料可用时，记 `resource_only`（仅凭用户资料成档），降为告警；
 - `resource_intake` 门禁检查用户资料摄入：未归类 / 抽取失败项会列出告警（原件已备份）；用户资料图跳过官网同域校验（`image_provenance`）；
 - 汇总表、档案、目录和英文集合必须一致；
-- 图片内容需视觉核对，结论写入 `视觉核对.json`：标“不符”即报红，未核对默认告警；加 `--require-visual` 后未核对直接报红。
+- 图片内容需视觉核对，结论写入 `视觉核对.json`：官网抓取图标“不符”或未回写均报 error，默认 fail-closed；只有显式 `--skip-visual-review` 才降为告警。用户资料图按资料优先直通，但显式“不符”仍报 error；结论只认逐张图并绑定 sha256 与 reviewed_at。
 
 ## 视觉核对
 
@@ -173,7 +173,7 @@ python "$SkillRoot\scripts\gates.py" --deliverable "<...>\deliverable" --raw "<.
   --en "<...>\en.json" --summary "<...>\汇总.xlsx" --visual "<...>\视觉核对.json" --require-visual
 ```
 
-类别结论可被单张覆盖；重跑会保留已有结论。全部核对完成并通过门禁后，用 `local_pipeline.py --publish-stage "<...>\build\<run_id>" --out "<输出目录>"` 发布。
+结论只认逐张图，不支持类别继承；重跑时只有旧结论的 sha256 与当前图片一致才保留，图片变化会自动作废并重新进入待核对。`--apply` 会写入 reviewed_at。全部核对完成并通过门禁后，用 `local_pipeline.py --publish-stage "<...>\build\<run_id>" --out "<输出目录>"` 发布，发布前会再跑一次完整门禁。
 
 门禁红色先修数据或补抓，不要下调阈值迁就数据。
 
@@ -186,6 +186,6 @@ python "$SkillRoot\scripts\gates.py" --deliverable "<...>\deliverable" --raw "<.
 - **新环境可复现性（已实测）。** 在全新克隆、无 `.venv` 的目录上跑 `bootstrap.ps1`（从 PyPI 装锁定依赖）后再用 `run_local.ps1`，含官网场景与"仅资料、无官网"（`resource_only`）场景均门禁全绿、退出码 0；交付严格为"五文件夹 + 产品清单.xlsx"、五个文件夹内零子目录，PDF/PPT/DOCX/XLSX 原件只落在 `deliverable` 之外的 `原始资料备份/`。该结论是干净克隆模拟，不等同于全新物理机。
 - **必须联网。** `bootstrap.ps1` 从 PyPI 安装依赖、官网抓取、MyMemory 翻译都依赖网络；断网环境需预先离线装好依赖与渲染内核，并自行准备离线 HTML 快照（`-HtmlDir`）。
 - **PDF 抽取是尽力而为。** 环境有 `pypdf`/`PyPDF2` 时抽前 20 页；没有时 PDF 只归档并在 `资料备注` 记"PDF 未抽到文本"，不阻断主流程。PPTX 用 zipfile+XML 抽文本，不依赖 `python-pptx`。
-- **必须由 Codex 复核的项**：官网自动发现置信度为中/低时须打开站点确认并填写复核表，未复核默认跳过；`visual_review` 必须看图回写结论后才能发布；图片直链走 CDN 的外域需人工确认。
+- **必须由 Codex 复核的项**：官网自动发现置信度为中/低时须打开站点确认并填写复核表，未复核默认跳过；`visual_review` 必须看图回写结论后才能发布；图片直链外域或命中聚合站直接判 error，处理方式是删除并重抓，不能靠人工确认放行。
 
 详细说明见 `SKILL.md` 和 `references/`。
